@@ -62,11 +62,11 @@ tensor wrapping; both are off the per-image hot path.
 | Layer | Location | What lives there |
 |---|---|---|
 | Pipeline core | `rust/sglang-mm/src/driver.rs` | model-independent driver: fetch → decode → preprocess → hash → expand → M-RoPE (rayon) |
-| | `rust/sglang-mm/src/common/{fetch,payload,tokens,resize,transforms}.rs` | media fetch; msgpack payload decode; placeholder expansion; PIL-exact Lanczos/Bicubic resize |
+| | `rust/sglang-mm/src/common/{fetch,tokens,resize,transforms}.rs` | media fetch; placeholder expansion; PIL-exact Lanczos/Bicubic resize |
 | | `rust/sglang-mm/src/qwen_vl/mod.rs` | `QwenVlProcessor` (`VisionProcessor` impl) + feature-gated parity bindings |
 | | `rust/sglang-mm/src/registry.rs` | `VisionProcessor` trait, `Pipeline`, `pipeline_from_spec` (family dispatch) |
 | Server integration | `rust/sglang-server/src/mm.rs` | worker pool + sidecar; drives the sglang-mm driver with the server tokenizer |
-| | `rust/sglang-server/src/message/request.rs` | mm fields on the wire body, per-item fan-out, mm payload encoding |
+| | `rust/sglang-server/src/message/{request,mm_payload}.rs` | mm fields on the wire body, per-item fan-out, mm payload encoding + typed decode (the wire contract has one owner) |
 | | `rust/sglang-server/src/tokenizer_manager/ingress.rs`, `fsm.rs` | `Encoding` stage: park/dispatch/resume/reject |
 | | `rust/sglang-server/src/lib.rs` | pyo3 surface: `start_mm_workers(spec_json, workers)`, `take_mm(rid)` |
 | Python side | `python/sglang/srt/managers/rust_server.py` | `NativeMmHost` (spec build + launch gate), drain-time zero-copy adapter |
@@ -100,7 +100,7 @@ unrecognized knob returns `None` and the launch gate fails. For `qwen_vl`:
 
 | Layer | Where | Run with |
 |---|---|---|
-| Pure-Rust unit tests (fetch, payload, tokens, qwen_vl geometry) | `#[cfg(test)]` in `rust/sglang-mm/src/**` | `cd rust/sglang-mm && cargo test --no-default-features` (CI: `pr-test-rust-exts.yml`) |
+| Pure-Rust unit tests (fetch, tokens, driver, qwen_vl geometry; payload in `sglang-server`) | `#[cfg(test)]` in `rust/sglang-mm/src/**`, `rust/sglang-server/src/message/mm_payload.rs` | `cd rust/sglang-mm && cargo test --no-default-features` (CI: `pr-test-rust-exts.yml`) |
 | Server framework tests (mm fan-out, ingress Encoding arms, msgpack shapes) | `#[cfg(test)]` in `rust/sglang-server/src/**` | `cd rust && cargo test -p sglang-server` |
 | CPU parity suite vs real HF processors (preprocess, prompt geometry, scheduler-boundary output, drain adapter, error paths) | `test/registered/unit/multimodal/rust/{qwen,shared}/` | `python3 <file>` directly, or CI suite `base-a-test-cpu` (`_core` is built by `pip install -e python`) |
 | GPU e2e smoke (live sidecar handoff, multi-image, rejection paths) | `test/registered/vlm/test_rust_native_mm.py` | 1 GPU; CI stage `base-b` |

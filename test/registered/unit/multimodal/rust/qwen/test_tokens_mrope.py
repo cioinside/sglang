@@ -1,4 +1,11 @@
-"""Qwen placeholder expansion, offsets, and M-RoPE parity."""
+"""Qwen placeholder expansion, offsets, and M-RoPE parity.
+
+Covers ``expand_placeholders`` in ``rust/sglang-mm/src/common/tokens.rs`` and
+``mrope_image_only`` in ``rust/sglang-mm/src/qwen_vl/mod.rs`` (via the
+``_core.qwen_vl.process_native_mm`` and ``mrope_image_only_py``
+bindings), against ``BaseMultimodalProcessor`` expansion/offsets and
+``MRotaryEmbedding.get_rope_index``.
+"""
 
 import sys
 import unittest
@@ -15,10 +22,10 @@ from _utils import (  # noqa: E402
     IMAGE_TOKEN_ID,
     PROCESSOR_CONFIGS,
     VIDEO_TOKEN_ID,
+    VISION_END_ID,
     VISION_START_ID,
     image_bytes,
     load_core,
-    request_payload,
     spec_json,
 )
 
@@ -28,7 +35,7 @@ QWEN_CORE = getattr(load_core(), "qwen_vl", None)
 
 
 @unittest.skipUnless(
-    QWEN_CORE and hasattr(QWEN_CORE, "process_native_mm_payload"),
+    QWEN_CORE and hasattr(QWEN_CORE, "process_native_mm"),
     "sglang-mm native Qwen driver not built",
 )
 class TestQwenPromptGeometry(CustomTestCase):
@@ -41,13 +48,11 @@ class TestQwenPromptGeometry(CustomTestCase):
         for image_count in (1, 2):
             ids = [7]
             for _ in range(image_count):
-                ids.extend((VISION_START_ID, IMAGE_TOKEN_ID, 902, 8))
+                ids.extend((VISION_START_ID, IMAGE_TOKEN_ID, VISION_END_ID, 8))
             images = [image_bytes(96 + 8 * i, 80, i) for i in range(image_count)]
             with self.subTest(image_count=image_count):
-                actual_ids, _, grids, _, offsets, _, _ = (
-                    QWEN_CORE.process_native_mm_payload(
-                        request_payload(ids, images), spec_json(config)
-                    )
+                actual_ids, _, grids, _, offsets, _, _ = QWEN_CORE.process_native_mm(
+                    ids, images, spec_json(config)
                 )
                 counts = [t * h * w // config["merge_size"] ** 2 for t, h, w in grids]
                 expected_ids = BaseMultimodalProcessor._expand_input_ids(
@@ -73,7 +78,7 @@ class TestQwenPromptGeometry(CustomTestCase):
             start = len(ids) - 1
             ids.extend([IMAGE_TOKEN_ID] * (np.prod(grid) // 4 - 1))
             items.append((start, len(ids) - 1, *grid))
-            ids.extend((902, 11))
+            ids.extend((VISION_END_ID, 11))
 
         actual, delta = QWEN_CORE.mrope_image_only_py(len(ids), items, 2)
         actual = np.asarray(actual).reshape(3, -1)

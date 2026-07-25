@@ -6,6 +6,7 @@
 //! [`sampling`] (sampling-params normalization, the Python `SamplingParams` port).
 
 mod egress;
+pub mod mm_payload;
 mod request;
 mod sampling;
 

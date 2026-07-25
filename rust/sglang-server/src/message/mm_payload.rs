@@ -1,26 +1,17 @@
-//! Server multimodal request payload parsing.
+//! The MM wire payload: parse the msgpack blob built by
+//! [`super::request::GenerateRequest::to_mm_payload_msgpack`] into the typed
+//! [`MmInput`] the `sglang-mm` driver consumes. Encoder and decoder live in
+//! this crate so the wire contract has one owner.
 //!
 //! Every `Err` rejects the request back to the client (there is no Python
 //! fallback path); the message says whether the input is malformed or merely
 //! outside the pipeline's scope (video/audio, precomputed features, ...).
 
 use rmpv::Value;
-
-#[derive(Debug)]
-pub enum ImageSource {
-    String(String),
-    Bytes(Vec<u8>),
-}
-
-#[derive(Debug)]
-pub struct Payload {
-    pub text: Option<String>,
-    pub input_ids: Option<Vec<i32>>,
-    pub images: Vec<ImageSource>,
-}
+use sglang_mm::driver::{ImageSource, MmInput};
 
 /// Decode `[text, input_ids, image_data, video_data, audio_data]`.
-pub fn parse(payload: &[u8]) -> Result<Payload, String> {
+pub fn parse(payload: &[u8]) -> Result<MmInput, String> {
     let value = rmpv::decode::read_value(&mut &payload[..])
         .map_err(|e| format!("mm payload decode: {e}"))?;
     let Value::Array(fields) = value else {
@@ -35,7 +26,12 @@ pub fn parse(payload: &[u8]) -> Result<Payload, String> {
 
     let text = match &fields[0] {
         Value::Nil => None,
-        Value::String(value) => value.as_str().map(str::to_owned),
+        Value::String(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| "mm payload: non-utf8 text".to_string())?
+                .to_owned(),
+        ),
         _ => return Err("mm payload: non-string text".into()),
     };
     let input_ids = match &fields[1] {
@@ -46,7 +42,7 @@ pub fn parse(payload: &[u8]) -> Result<Payload, String> {
                 .map(|value| {
                     value
                         .as_i64()
-                        .map(|id| id as i32)
+                        .and_then(|id| i32::try_from(id).ok())
                         .ok_or_else(|| "mm payload: non-int input id".to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -59,7 +55,7 @@ pub fn parse(payload: &[u8]) -> Result<Payload, String> {
     if images.is_empty() {
         return Err("no raw image sources in mm payload".into());
     }
-    Ok(Payload {
+    Ok(MmInput {
         text,
         input_ids,
         images,
@@ -96,8 +92,8 @@ fn collect_images(value: &Value, out: &mut Vec<ImageSource>) -> Result<(), Strin
 }
 
 /// Rust mirror of Python `has_valid_data`: `nil` and (recursively) empty /
-/// all-nil lists don't count as multimodal input. Shared with the server's
-/// `has_multimodal` routing check so the two can never drift.
+/// all-nil lists don't count as multimodal input. Shared with the ingress
+/// `has_multimodal` routing check so routing and parsing can never drift.
 pub fn value_present(value: &Value) -> bool {
     match value {
         Value::Nil => false,
@@ -147,12 +143,13 @@ mod tests {
             Value::from("video.mp4"),
             Value::Nil,
         ]);
-        assert!(parse(&video).unwrap_err().contains("video/audio"));
+        assert!(parse(&video).err().unwrap().contains("video/audio"));
 
         let dict = Value::Map(vec![(Value::from("format"), Value::from("x"))]);
         assert!(
             parse(&image_payload(Value::Array(vec![dict])))
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .contains("image_data shape")
         );
     }
@@ -182,20 +179,26 @@ mod tests {
     fn image_free_payload_rejected() {
         assert!(
             parse(&image_payload(Value::Nil))
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .contains("no raw image sources")
         );
     }
 
     #[test]
     fn rejects_non_integer_input_ids() {
-        let payload = encode(vec![
-            Value::Nil,
-            Value::Array(vec![Value::from("not-an-id")]),
-            Value::from("a"),
-            Value::Nil,
-            Value::Nil,
-        ]);
-        assert!(parse(&payload).is_err());
+        for bad_id in [
+            Value::from("not-an-id"),
+            Value::from(i64::from(i32::MAX) + 1),
+        ] {
+            let payload = encode(vec![
+                Value::Nil,
+                Value::Array(vec![bad_id]),
+                Value::from("a"),
+                Value::Nil,
+                Value::Nil,
+            ]);
+            assert!(parse(&payload).is_err());
+        }
     }
 }

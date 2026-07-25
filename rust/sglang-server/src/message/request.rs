@@ -276,8 +276,7 @@ pub struct MmRequest {
 /// Delegates to the same `value_present` the MM worker's payload parser uses,
 /// so routing and parsing can never disagree on what counts as present.
 fn mm_value_present(v: &Option<rmpv::Value>) -> bool {
-    v.as_ref()
-        .is_some_and(sglang_mm::common::payload::value_present)
+    v.as_ref().is_some_and(super::mm_payload::value_present)
 }
 
 /// Request variant — selects the ingress branch, scheduler wire message, and
@@ -361,7 +360,7 @@ impl GenerateRequest {
 
     /// Serialize the fields the MM worker pool needs for this request: a
     /// msgpack array `[text, input_ids, image_data, video_data, audio_data]`
-    /// (decoded by `sglang-mm`'s `payload::parse` in the native pipeline).
+    /// (decoded by [`super::mm_payload::parse`] in the native pipeline).
     pub fn to_mm_payload_msgpack(&self) -> Result<Bytes, Error> {
         use rmpv::Value;
         let text_val = match &self.text {

@@ -25,13 +25,12 @@ from _utils import (  # noqa: E402
     PROCESSOR_CONFIGS,
     image_bytes,
     load_core,
-    request_payload,
 )
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 CORE = load_core()
-DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_native_mm_payload", None)
+DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_native_mm", None)
 
 
 @unittest.skipUnless(DRIVER, "sglang-mm native Qwen driver not built")
@@ -64,7 +63,7 @@ class TestQwenSchedulerInputParity(CustomTestCase):
         input_ids = []
         for _ in sources:
             input_ids.extend((1, 2, 3, 4))
-        raw = DRIVER(request_payload(input_ids, sources), spec)
+        raw = DRIVER(input_ids, sources, spec)
         ids, features, grids, hashes, offsets, mrope, delta = raw
 
         rust_output = host.build_native_mm(
