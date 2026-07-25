@@ -10,6 +10,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    Phase,
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -100,19 +101,28 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         self.assertFalse(runner.can_run_graph(forward_batch))
 
-    def test_embedding_gemma_forces_breakable_prefill(self):
+    def _embedding_gemma_args(self, locked_prefill_backend: bool):
         args = ServerArgs(model_path="dummy")
         args.model_config = SimpleNamespace(
             is_embedding_gemma=True,
             is_multimodal=False,
             hf_config=SimpleNamespace(architectures=["Gemma3TextModel"]),
+            context_len=2048,
         )
         args.cuda_graph_config = CudaGraphConfig(
             decode=PhaseConfig(backend=Backend.FULL),
-            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE),
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE, max_bs=2048),
+        )
+        args._cuda_graph_config_locked = (
+            {(Phase.PREFILL, "backend")} if locked_prefill_backend else set()
         )
         args.disable_radix_cache = False
         args.chunked_prefill_size = 2048
+
+        return args
+
+    def test_embedding_gemma_defaults_to_breakable_prefill(self):
+        args = self._embedding_gemma_args(locked_prefill_backend=False)
 
         with (
             patch.object(args, "get_model_config", return_value=args.model_config),
@@ -124,6 +134,17 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         self.assertEqual(args.chunked_prefill_size, -1)
         self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_embedding_gemma_keeps_explicit_prefill_backend(self):
+        args = self._embedding_gemma_args(locked_prefill_backend=True)
+
+        with (
+            patch.object(args, "get_model_config", return_value=args.model_config),
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+        ):
+            args._handle_model_capability_adjustments()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
 
 
 if __name__ == "__main__":

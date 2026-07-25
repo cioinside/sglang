@@ -3154,7 +3154,12 @@ class ServerArgs:
                 self._validate_prefill_only_disable_kv_cache_args()
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             if is_cuda() and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
-                self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
+                # Keep an explicitly selected prefill graph backend.  BCG is
+                # the safe default for this bidirectional model, while the
+                # tc_piecewise backend is a useful opt-in for deployments
+                # that prioritize compiled prefill throughput.
+                if (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked:
+                    self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
                 # CUDA-graph sizing has already run by this point. With
                 # chunked prefill disabled its generic default is -1, which
                 # otherwise leaves BCG with no shapes to capture. Use the
@@ -3173,7 +3178,8 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.info(
                 "EmbeddingGemma detected: disabling radix cache and chunked "
-                "prefill; using breakable CUDA graph for CUDA prefill."
+                "prefill; using %s CUDA graph for CUDA prefill.",
+                self.cuda_graph_config.prefill.backend,
             )
 
         if (
