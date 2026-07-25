@@ -63,8 +63,8 @@ tensor wrapping; both are off the per-image hot path.
 |---|---|---|
 | Pipeline core | `rust/sglang-mm/src/driver.rs` | model-independent driver: fetch → decode → preprocess → hash → expand → M-RoPE (rayon) |
 | | `rust/sglang-mm/src/common/{fetch,tokens,resize,transforms}.rs` | media fetch; placeholder expansion; PIL-exact Lanczos/Bicubic resize |
-| | `rust/sglang-mm/src/qwen_vl/mod.rs` | `QwenVlProcessor` (`VisionProcessor` impl) + feature-gated parity bindings |
-| | `rust/sglang-mm/src/registry.rs` | `VisionProcessor` trait, `Pipeline`, `pipeline_from_spec` (family dispatch) |
+| | `rust/sglang-mm/src/qwen_vl/mod.rs` | `QwenVlProcessor` (`MmFamilyProcessor` impl) + feature-gated parity bindings |
+| | `rust/sglang-mm/src/registry.rs` | `MmFamilyProcessor` trait, `Pipeline`, `pipeline_from_spec` (family dispatch) |
 | Server integration | `rust/sglang-server/src/mm.rs` | worker pool + sidecar; drives the sglang-mm driver with the server tokenizer |
 | | `rust/sglang-server/src/message/{request,mm_payload}.rs` | mm fields on the wire body, per-item fan-out, mm payload encoding + typed decode (the wire contract has one owner) |
 | | `rust/sglang-server/src/tokenizer_manager/ingress.rs`, `fsm.rs` | `Encoding` stage: park/dispatch/resume/reject |
@@ -108,7 +108,7 @@ unrecognized knob returns `None` and the launch gate fails. For `qwen_vl`:
 
 ## Adding a new model family
 
-1. **Implement `VisionProcessor`** in `rust/sglang-mm/src/<family>/mod.rs`:
+1. **Implement `MmFamilyProcessor`** in `rust/sglang-mm/src/<family>/mod.rs`:
    `process_image` (HWC u8 → model-ready features + patch grid),
    `tokens_per_image`, and `mrope_image_only` (or the model's position
    scheme). Parse the family's spec struct from the spec JSON
