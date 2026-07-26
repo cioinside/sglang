@@ -17,36 +17,77 @@ Built two ways:
 ```
 src/
 ├── lib.rs                    # module root; PyO3 module (_core) feature-gated
-├── registry.rs               # ImageProcessorSpec registry (Python-facing)
-│                             # + MmFamilyProcessor trait / pipeline_from_spec
-│                             #   (pure-Rust pipeline driven by sglang-server)
+├── family.rs                 # the model-family seam: MmFamilyProcessor trait
+│                             #   + the carriers (NamedTensors, TokenLayout, ...)
 ├── driver.rs                 # model-independent request driver (fetch →
-│                             #   decode → preprocess → expand → M-RoPE)
+│                             #   decode → process_item → layout → positions)
+├── registry.rs               # ImageProcessorSpec registry (Python-facing)
+│                             #   + pipeline_from_spec (family factory)
 ├── common/
-│   ├── mod.rs                # thread pool, image decode, SHA256 hash, base64
+│   ├── mod.rs                # thread pool, image decode, content hash, base64
 │   ├── fetch.rs              # media source → bytes (data:/base64/file/http)
 │   ├── resize.rs             # PIL-exact Lanczos + Bicubic resize
-│   ├── tokens.rs             # placeholder-id expansion + per-item offsets
+│   ├── tokens.rs             # TokenLayout mechanics (apply_layout + helpers)
 │   └── transforms.rs         # reusable primitives: normalize, pad, extract_patches
 └── <model>/
     └── mod.rs                # model-specific processor (inkling, qwen_vl, ...)
 ```
 
-## Native server pipeline (`MmFamilyProcessor`)
+## Native server pipeline architecture
 
-`sglang-server`'s MM workers process image-only requests for supported model
-families entirely in Rust: `common::fetch` → decode → the family's
-`MmFamilyProcessor` (resize/normalize/patchify + M-RoPE) → `common::tokens`
-placeholder expansion. The Python side selects the family by passing a spec
-JSON (`{"family": "qwen_vl", ...resolved processor params}`) to
-`registry::pipeline_from_spec`. Anything outside a family's scope
-(video/audio, precomputed features, unknown source shapes, placeholder
-mismatches) is rejected back to the client as a 400 — there is no Python
-fallback path.
+The pipeline that `sglang-server`'s MM workers drive is built to eventually
+carry **every** model family the Python multimodal processors serve today.
+Its one design rule: **families produce data, the driver owns control flow.**
+
+`driver::process` is the fixed request skeleton — parallel fetch/decode
+fan-out, layout application, position computation, failure semantics — and
+contains zero model knowledge. A model family implements the
+`MmFamilyProcessor` trait (`family.rs`) and only describes *what*, never
+*how*:
+
+- **`process_item`** — decoded media in, `ProcessedItem` out, mirroring
+  Python's `MultimodalDataItem`: the primary feature tensor (hashed by the
+  driver for item identity, standing in for `hash_feature`), named auxiliary
+  tensors for the model runner (`image_grid_thw`, and for other families
+  `image_sizes`, `tgt_sizes`, ... — the `model_specific_data` analogue), and
+  a `Geometry` value for the family's own later hooks.
+- **`layout`** — prompt geometry *as data*: a [`TokenLayout`] of
+  `Text`/`Media` segments, where a media span is either `Repeat` (qwen's
+  `<|image_pad|>` × N) or `Explicit` ids (tile markers, row separators,
+  wrapper tokens — the minicpm/internvl-style structured schemes). The
+  driver applies it mechanically (`common::tokens::apply_layout`), so final
+  input ids and per-item offsets derive from one declarative structure and
+  the family cannot get expansion, offsets, and positions out of sync.
+  `layout` sees the whole prompt and all items, so whole-request schemes are
+  expressible without giving families the control flow.
+- **`positions`** — a position *scheme*, not a computation slot: `Rope1D`
+  (default, scheduler needs nothing) or `MRope` (qwen).
+- **`capabilities`** — modalities the family accepts; the server's message
+  layer rejects everything else per family.
+
+Why this instead of Python's "each family overrides
+`process_mm_data_async`": in a server core there is no exception handler
+upstream — every request must resolve to exactly one accept/reject with its
+buffers parked in order, and that invariant is structural only if the driver
+owns the flow. The wide seam also decays (Python's base class has been
+steadily pulling duplicated expansion/offset logic back out of subclasses);
+the narrow seam starts where that converged.
+
+Growth path (deliberately not built speculatively): each carrier is an enum
+that grows a variant when a real family needs it — `DecodedMedia` per
+modality (video/audio), `Geometry` per family style (tile sets),
+`TensorData` per dtype. What stays in Python permanently: HF config
+resolution (families are configured by a spec JSON of resolved params,
+selected via `registry::pipeline_from_spec`) and the thin drain adapter
+mapping feature + aux tensors to model kwargs.
+
+Anything outside a family's declared scope (video/audio, precomputed
+features, unknown source shapes, placeholder mismatches) is rejected back to
+the client as a 400 — there is no Python fallback path.
 
 Supported families: `qwen_vl` (Qwen2-VL / 2.5-VL / 3-VL / 3.5; images only).
-Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a `family`
-arm in `pipeline_from_spec`.
+Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a
+`family` arm in `pipeline_from_spec`.
 
 `common::fetch` matches the Python `get_image_bytes` semantics
 (`REQUEST_TIMEOUT` env, proxy env vars) with two deliberate differences:
