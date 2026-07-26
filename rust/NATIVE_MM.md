@@ -108,13 +108,15 @@ unrecognized knob returns `None` and the launch gate fails. For `qwen_vl`:
 
 ## Adding a new model family
 
-1. **Implement `MmFamilyProcessor`** in `rust/sglang-mm/src/<family>/mod.rs`:
-   `process_image` (HWC u8 → model-ready features + patch grid),
-   `tokens_per_image`, and `mrope_image_only` (or the model's position
-   scheme). Parse the family's spec struct from the spec JSON
+1. **Implement `MmFamilyProcessor`** (`rust/sglang-mm/src/family.rs`) in
+   `rust/sglang-mm/src/<family>/mod.rs`: `process_item` (decoded media →
+   named tensors + geometry), `layout` (prompt geometry as a `TokenLayout`
+   value — `Repeat` for placeholder expansion, `Explicit` for structured
+   tile/marker schemes), and `positions` if the model has a scheme beyond
+   1D RoPE. Parse the family's spec struct from the spec JSON
    (`from_spec_json`). Add `#[cfg(test)]` geometry tests. Reuse
    `common::{resize, transforms, tokens}` where the model matches PIL/HF
-   semantics.
+   semantics. See the design introduction in `rust/sglang-mm/README.md`.
 2. **Register the family**: add a match arm in
    `registry::pipeline_from_spec` (`rust/sglang-mm/src/registry.rs`)
    and `pub mod <family>;` in `rust/sglang-mm/src/lib.rs`. If you add parity

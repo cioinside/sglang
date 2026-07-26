@@ -17,8 +17,18 @@ use crate::message::MmRequest;
 use crate::tokenizer::TextTokenizer;
 use crate::tokenizer_manager::TmEvent;
 
-/// One mm result: everything the drain-time Python adapter needs.
-pub type MmResult = sglang_mm::driver::MmResult;
+/// One mm result: everything the drain-time Python adapter needs. This is
+/// the qwen scheduler-drain shape (`sglang_mm::qwen_vl::pack_drain`);
+/// it generalizes to a named-tensor handoff when a family needs a
+/// different shape.
+pub struct MmResult {
+    pub features: Vec<f32>,
+    pub grids: Vec<[u32; 3]>,
+    pub hashes: Vec<u64>,
+    pub offsets: Vec<(u32, u32)>,
+    pub mrope: Vec<i64>,
+    pub mrope_delta: i64,
+}
 
 /// Results parked between a worker's `MmEncoded` and the scheduler's drain.
 /// An entry is stored strictly before `MmEncoded` is emitted and popped by
@@ -28,7 +38,7 @@ pub type Sidecar = Arc<Mutex<HashMap<String, MmResult>>>;
 
 /// Shared state of the mm path, built once at `start_mm_workers`.
 pub struct Context {
-    pub pipeline: sglang_mm::registry::Pipeline,
+    pub family: Box<dyn sglang_mm::family::MmFamilyProcessor>,
     /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
     pub sidecar: Sidecar,
@@ -41,7 +51,7 @@ impl Context {
         sidecar: Sidecar,
     ) -> Result<Self, String> {
         Ok(Self {
-            pipeline: sglang_mm::registry::pipeline_from_spec(spec_json)?,
+            family: sglang_mm::registry::pipeline_from_spec(spec_json)?,
             tokenizer,
             sidecar,
         })
@@ -53,18 +63,25 @@ impl Context {
 /// strictly before returning); `Err` rejects the request back to the client.
 fn process(ctx: &Context, req: &MmRequest) -> Result<Vec<i32>, String> {
     let input = crate::message::mm_payload::parse(&req.payload)?;
-    let output = sglang_mm::driver::process(&ctx.pipeline, input, |text| {
+    let output = sglang_mm::driver::process(ctx.family.as_ref(), input, |text| {
         let tokenizer = ctx.tokenizer.as_ref().ok_or_else(|| {
             "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()
         })?;
         tokenizer.encode(text).map_err(|error| error.to_string())
     })?;
-    let input_ids = output.input_ids;
-    ctx.sidecar
-        .lock()
-        .unwrap()
-        .insert(req.rid.clone(), output.mm);
-    Ok(input_ids)
+    let drain = sglang_mm::qwen_vl::pack_drain(output)?;
+    ctx.sidecar.lock().unwrap().insert(
+        req.rid.clone(),
+        MmResult {
+            features: drain.features,
+            grids: drain.grids,
+            hashes: drain.hashes,
+            offsets: drain.offsets,
+            mrope: drain.mrope,
+            mrope_delta: drain.mrope_delta,
+        },
+    );
+    Ok(drain.input_ids)
 }
 
 /// Spawn `workers` `mm-worker-{i}` threads and return their join handles for
