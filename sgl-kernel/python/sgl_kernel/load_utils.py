@@ -5,7 +5,6 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import List
 
 import torch
 
@@ -83,7 +82,7 @@ def _load_architecture_specific_ops():
     logger.debug(f"[sgl_kernel] Found files: {raw_matching_files}")
     logger.debug(f"[sgl_kernel] Prioritized files: {matching_files}")
 
-    previous_import_errors: List[Exception] = []
+    previous_import_errors: list[Exception] = []
 
     # Try to load from the architecture-specific directory
     if matching_files:
@@ -138,7 +137,7 @@ def _load_architecture_specific_ops():
 
             logger.debug(f"[sgl_kernel] Loading fallback module from {alt_path}...")
             spec.loader.exec_module(common_ops)
-            logger.debug(f"[sgl_kernel] ✓ Successfully loaded fallback library")
+            logger.debug("[sgl_kernel] ✓ Successfully loaded fallback library")
             logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
             return common_ops
 
@@ -154,12 +153,12 @@ def _load_architecture_specific_ops():
 
     # Final attempt: try standard Python import (for backward compatibility)
     logger.debug(
-        f"[sgl_kernel] Final attempt: trying standard Python import 'common_ops'"
+        "[sgl_kernel] Final attempt: trying standard Python import 'common_ops'"
     )
     try:
         import common_ops
 
-        logger.debug(f"[sgl_kernel] ✓ Successfully imported via standard Python import")
+        logger.debug("[sgl_kernel] ✓ Successfully imported via standard Python import")
         logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
         return common_ops
     except ImportError as e:
