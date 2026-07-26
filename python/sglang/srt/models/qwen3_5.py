@@ -2242,11 +2242,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                     expert_id,
                                 )
                     else:
-                        # Skip loading extra parameters for GPTQ models.
-                        if (
-                            name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
-                        ):
+                        if name_mapped not in params_dict:
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or

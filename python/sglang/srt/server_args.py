@@ -8415,6 +8415,9 @@ class ServerArgs:
                 "Communications quantization is only supported for NPU device"
             )
 
+    def check_torch_2_9_1_cudnn_compatibility(self):
+        return  # Conv3d CuDNN bug is irrelevant for text-only LLM serving
+
         # grpc_port is None for HTTP-only launches, so the == comparison is
         # already False there; no explicit None check needed.
         if not (self.smg_grpc_mode or self.grpc_mode) and self.grpc_port == self.port:
