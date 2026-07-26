@@ -11,6 +11,8 @@
 
 > **Fork of [SGLang](https://github.com/sgl-project/sglang) v0.5.9** with patches to enable NVIDIA Ampere (SM80/SM86) GPU support.
 
+> **Patch 1 (SM86→SM90 binary fallback) is based on [grevinden/sglang-kt-sm86](https://github.com/grevinden/sglang-kt-sm86)** — a Docker-based SGLang build for SM86/SM89 GPUs. Their `load_utils_sm86.patch` for `sgl_kernel` was the starting point for our SM86 support. We extended it with a null-safety check (`is not None`) and added two additional patches for CuDNN and AWQ weight loading.
+
 ## Problem
 
 SGLang v0.5.9 dropped Ampere GPU support in the `sgl-kernel` package. The upstream only ships prebuilt CUDA binaries for SM90 (Hopper/H100) and SM100 (Blackwell). On Ampere GPUs (RTX 3060, RTX 3070, RTX 3080, RTX 3090, A100, etc.), SGLang crashes at startup:
@@ -26,6 +28,8 @@ Additionally, SGLang's CuDNN compatibility check blocks text-only LLM serving (t
 
 ### Patch 1: `sgl-kernel` SM86→SM90 Binary Fallback
 
+> **Based on [grevinden/sglang-kt-sm86](https://github.com/grevinden/sglang-kt-sm86)** — original `patches/load_utils_sm86.patch`.
+
 **File**: `sgl-kernel/python/sgl_kernel/load_utils.py`
 
 Adds a fallback path for GPUs with compute capability < 90 (all Ampere cards) to load the SM90 (Hopper) `common_ops` binaries. The SM90 fast-math binaries are compatible with SM86 — same architecture generation, identical instruction set for the operations SGLang uses.
@@ -34,17 +38,21 @@ Adds a fallback path for GPUs with compute capability < 90 (all Ampere cards) to
 
 ### Patch 2: Skip CuDNN Conv3d Compatibility Check
 
-**File**: `python/sglang/srt/server_args.py`
+**File**: `python/sglang/srt/server_args.py` (function `_check_cudnn_fa_info`)
 
 Bypasses the PyTorch 2.9.1 / CuDNN < 9.15 compatibility check. This check was added for `nn.Conv3d` performance (multimodal models only). For text-only LLM serving, Conv3d is never used, so the check is irrelevant and blocks startup unnecessarily.
+
+**Change**: Replaces the existing CuDNN version check body with an early `return` — the function still exists for API compatibility but no longer blocks server startup.
 
 **Effect**: Eliminates the `CRITICAL WARNING: PyTorch 2.9.1 & CuDNN Compatibility Issue Detected` error when serving text models.
 
 ### Patch 3: AWQ MoE Weight Loader — Skip Unknown Parameters
 
-**File**: `python/sglang/srt/models/qwen3_5.py`
+**File**: `python/sglang/srt/models/qwen3_5.py` (in `Qwen3_5ForConditionalGeneration.load_weights()`)
 
 Relaxes the Qwen3.5 MoE weight loader to skip any parameter not found in `params_dict`, not just those ending with known GPTQ suffixes. AWQ-quantized checkpoints (e.g., `QuantTrio/Qwen3.6-35B-A3B-AWQ`) use mixed key formats — the first layer has standard `.weight` keys (fp16) while subsequent layers use `.qweight/.qzeros/.scales` keys. The upstream code only skips keys ending with specific GPTQ suffixes, causing a `KeyError` on unrecognized parameter names.
+
+**Change**: Extends the `ignore_suffixes` condition to also `continue` (skip) any key not present in `params_dict` — catches all unknown parameters regardless of naming convention.
 
 **Effect**: AWQ-quantized Qwen3.5 MoE models load successfully in SGLang.
 
@@ -104,6 +112,10 @@ python -m sglang.launch_server \
 ## Patch Files
 
 Individual patches are in [`patches/sm86/`](patches/sm86/) for easy application to any SGLang version.
+
+## Acknowledgments
+
+- **[grevinden/sglang-kt-sm86](https://github.com/grevinden/sglang-kt-sm86)** — Provided the original SM86→SM90 binary fallback approach for `sgl_kernel/load_utils.py` (Patch 1). Their Docker-based build workflow and CI/CD setup for SM86/SM89 GPUs was instrumental in validating the fast-math binary fallback strategy on Ampere hardware.
 
 ---
 

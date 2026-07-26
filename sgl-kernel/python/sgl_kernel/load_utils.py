@@ -62,6 +62,7 @@ def _load_architecture_specific_ops():
         variant_name = "SM90 (Hopper/H100 with fast math optimization)"
     elif compute_capability is not None and compute_capability < 90:
         # Ampere (SM86/SM80) falls back to sm90 binaries — same generation, compatible
+        # Based on: https://github.com/grevinden/sglang-kt-sm86
         ops_subdir = "sm90"
         variant_name = f"SM{compute_capability} (using sm90 fast-math fallback)"
     elif compute_capability is not None:

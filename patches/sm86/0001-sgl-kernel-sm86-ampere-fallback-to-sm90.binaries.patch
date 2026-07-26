@@ -1,3 +1,6 @@
+# Based on the SM86 fallback patch from https://github.com/grevinden/sglang-kt-sm86
+# by grevinden — original load_utils_sm86.patch for sgl_kernel on Ampere GPUs.
+# Extended with null-safety check (`is not None`) for robustness.
 diff --git a/sgl-kernel/python/sgl_kernel/load_utils.py b/sgl-kernel/python/sgl_kernel/load_utils.py
 index 5c37402b37..6c84cfdac2 100644
 --- a/sgl-kernel/python/sgl_kernel/load_utils.py
