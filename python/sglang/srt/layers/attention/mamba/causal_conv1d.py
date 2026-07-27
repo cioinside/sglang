@@ -24,7 +24,12 @@ try:
     from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
     torch.ops.sgl_kernel.causal_conv1d_update
-    _HAS_SGL_KERNEL = True
+    # SM86 (Ampere) check: sgl-kernel binaries are compiled for sm90;
+    # causal_conv1d_fwd has a dtype assertion that fails on sm86.
+    # Force Triton fallback for non-sm90+ GPUs.
+    _dev = torch.cuda.current_device()
+    _cc = torch.cuda.get_device_capability(_dev)
+    _HAS_SGL_KERNEL = (_cc[0] >= 9)
 except (ImportError, AttributeError):
     _HAS_SGL_KERNEL = False
 

@@ -1,0 +1,17 @@
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 7ad4b6ecf2..cba140a99f 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1376,6 +1376,12 @@ class Qwen3_5ForCausalLM(nn.Module):
+             pp_rank=self.pp_group.rank_in_group,
+             pp_size=self.pp_group.world_size,
+             prefix=f"{prefix}.layers",
++            offloader_kwargs=dict(
++                submodule_accessor=lambda layer: layer.mlp.experts,
++                whitelist_param_names_creator=lambda module: [
++                    n for n, _ in module.named_parameters()
++                ],
++            ) if getattr(config, 'num_experts', 0) > 1 else None,
+         )
+ 
+         # Final normalization

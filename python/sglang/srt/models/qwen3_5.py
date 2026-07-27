@@ -1376,6 +1376,12 @@ class Qwen3_5ForCausalLM(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
+            offloader_kwargs=dict(
+                submodule_accessor=lambda layer: layer.mlp.experts,
+                whitelist_param_names_creator=lambda module: [
+                    n for n, _ in module.named_parameters()
+                ],
+            ) if getattr(config, 'num_experts', 0) > 1 else None,
         )
 
         # Final normalization
@@ -2242,11 +2248,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                     expert_id,
                                 )
                     else:
-                        # Skip loading extra parameters for GPTQ models.
-                        if (
-                            name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
-                        ):
+                        if name_mapped not in params_dict:
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
