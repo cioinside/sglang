@@ -1,0 +1,43 @@
+From 38c98d7049bce914020de53ef8bfccca961c5543 Mon Sep 17 00:00:00 2001
+From: root <root@owui-llama-n8n.cioinside.com>
+Date: Mon, 27 Jul 2026 11:19:46 +0000
+Subject: [PATCH] fix: force Triton fallback for causal_conv1d on non-sm90 GPUs
+
+sgl-kernel 0.3.21 binaries are compiled for sm90/sm100. The
+causal_conv1d_fwd CUDA kernel has a dtype assertion
+(scalar_type() == input_type) that fails on SM86 (Ampere)
+even when input dtypes are technically valid, because the
+compiled kernel expects Hopper-specific behavior.
+
+The Triton fallback path already exists in the codebase but
+never triggers because sgl_kernel is always installed. Detect
+GPU compute capability and set _HAS_SGL_KERNEL=False for
+non-sm90+ GPUs, forcing the architecture-agnostic Triton path.
+
+Tested on 2x RTX 3060 12GB (SM86): inference works correctly
+with --dtype bfloat16 --disable-cuda-graph.
+---
+ python/sglang/srt/layers/attention/mamba/causal_conv1d.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/layers/attention/mamba/causal_conv1d.py b/python/sglang/srt/layers/attention/mamba/causal_conv1d.py
+index 4601f1df53..392b173606 100644
+--- a/python/sglang/srt/layers/attention/mamba/causal_conv1d.py
++++ b/python/sglang/srt/layers/attention/mamba/causal_conv1d.py
+@@ -24,7 +24,12 @@ try:
+     from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
+ 
+     torch.ops.sgl_kernel.causal_conv1d_update
+-    _HAS_SGL_KERNEL = True
++    # SM86 (Ampere) check: sgl-kernel binaries are compiled for sm90;
++    # causal_conv1d_fwd has a dtype assertion that fails on sm86.
++    # Force Triton fallback for non-sm90+ GPUs.
++    _dev = torch.cuda.current_device()
++    _cc = torch.cuda.get_device_capability(_dev)
++    _HAS_SGL_KERNEL = (_cc[0] >= 9)
+ except (ImportError, AttributeError):
+     _HAS_SGL_KERNEL = False
+ 
+-- 
+2.51.0
+
