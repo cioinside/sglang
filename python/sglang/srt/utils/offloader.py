@@ -136,13 +136,17 @@ class OffloaderV1(BaseOffloader):
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                device_state = {
-                    # here we blindly call `to(device)`
-                    # if the parameter is already on the device, it will be a no-op
-                    k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
-                }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs, tie_weights=False)
+                raw = module.state_dict()
+                seen_ptrs = {}
+                device_state = {}
+                for k, v in raw.items():
+                    ptr = v.data_ptr()
+                    if ptr in seen_ptrs:
+                        device_state[k] = device_state[seen_ptrs[ptr]]
+                    else:
+                        seen_ptrs[ptr] = k
+                        device_state[k] = v.to(device, non_blocking=True)
+                output = functional_call(module, device_state, args=args, kwargs=kwargs)
                 module.forward = forward
                 return output
 
