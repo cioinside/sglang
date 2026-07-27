@@ -1,0 +1,54 @@
+From ecab52c18568f86b3e375c4bd601e4ecf5ed961a Mon Sep 17 00:00:00 2001
+From: root <root@owui-llama-n8n.cioinside.com>
+Date: Mon, 27 Jul 2026 11:48:14 +0000
+Subject: [PATCH] fix: deduplicate tied params in V1 offloader device_state
+
+Qwen3.5 Mamba layers have tied parameters (linear_attn.attn.dt_bias /
+linear_attn.dt_bias). The previous state_dict()-based device_state
+contained both keys, causing functional_call to raise ValueError for
+duplicate tied parameters.
+
+Build device_state by deduplicating via data_ptr: tied params share
+storage, so the second key reuses the first key's device tensor.
+This fixes the ValueError crash.
+
+Known limitation: functional_call's reparametrization breaks AWQ Marlin
+quantized weight pointer access, causing garbage output with
+--cpu-offload-gb. The V1 offload path needs a Marlin-compatible
+reloading strategy to be usable with quantized models.
+---
+ python/sglang/srt/utils/offloader.py | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/python/sglang/srt/utils/offloader.py b/python/sglang/srt/utils/offloader.py
+index 8a58623522..be38c8dfa7 100644
+--- a/python/sglang/srt/utils/offloader.py
++++ b/python/sglang/srt/utils/offloader.py
+@@ -136,13 +136,17 @@ class OffloaderV1(BaseOffloader):
+ 
+             def forward(*args, **kwargs):
+                 module.forward = original_forward
+-                device_state = {
+-                    # here we blindly call `to(device)`
+-                    # if the parameter is already on the device, it will be a no-op
+-                    k: v.to(device, non_blocking=True)
+-                    for k, v in module.state_dict().items()
+-                }
+-                output = functional_call(module, device_state, args=args, kwargs=kwargs, tie_weights=False)
++                raw = module.state_dict()
++                seen_ptrs = {}
++                device_state = {}
++                for k, v in raw.items():
++                    ptr = v.data_ptr()
++                    if ptr in seen_ptrs:
++                        device_state[k] = device_state[seen_ptrs[ptr]]
++                    else:
++                        seen_ptrs[ptr] = k
++                        device_state[k] = v.to(device, non_blocking=True)
++                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                 module.forward = forward
+                 return output
+ 
+-- 
+2.51.0
+
