@@ -1,0 +1,125 @@
+diff --git a/python/sglang/srt/utils/offloader.py b/python/sglang/srt/utils/offloader.py
+index be38c8dfa7..599e9546c8 100644
+--- a/python/sglang/srt/utils/offloader.py
++++ b/python/sglang/srt/utils/offloader.py
+@@ -71,6 +71,7 @@ def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
+         assert (
+             server_args.cpu_offload_gb == 0
+         ), "V2 offload does not support cpu_offload_gb yet"
++        marlin_safe = server_args.quantization in ("awq_marlin", "gptq_marlin")
+         return OffloaderV2(
+             group_size=server_args.offload_group_size,
+             num_in_group=server_args.offload_num_in_group,
+@@ -78,6 +79,7 @@ def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
+             mode=server_args.offload_mode,
+             dp_rank=dp_rank,
+             dp_size=server_args.dp_size,
++            marlin_safe=marlin_safe,
+         )
+     return NoopOffloader()
+ 
+@@ -136,17 +138,15 @@ class OffloaderV1(BaseOffloader):
+ 
+             def forward(*args, **kwargs):
+                 module.forward = original_forward
+-                raw = module.state_dict()
+-                seen_ptrs = {}
+-                device_state = {}
+-                for k, v in raw.items():
+-                    ptr = v.data_ptr()
+-                    if ptr in seen_ptrs:
+-                        device_state[k] = device_state[seen_ptrs[ptr]]
+-                    else:
+-                        seen_ptrs[ptr] = k
+-                        device_state[k] = v.to(device, non_blocking=True)
+-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
++                saved_data = {}
++                for p in module.parameters():
++                    if p.device == torch.device("cpu"):
++                        gpu_data = p.data.to(device, non_blocking=True)
++                        saved_data[id(p)] = (p, p.data)
++                        p.data = gpu_data
++                output = module(*args, **kwargs)
++                for ptr_id, (p, orig_data) in saved_data.items():
++                    p.data = orig_data
+                 module.forward = forward
+                 return output
+ 
+@@ -164,11 +164,13 @@ class OffloaderV2(BaseOffloader):
+         mode: str,
+         dp_rank: int,
+         dp_size: int,
++        marlin_safe: bool = False,
+     ):
+         self.group_size = group_size
+         self.num_in_group = num_in_group
+         self.prefetch_step = prefetch_step
+         self.mode = mode
++        self.marlin_safe = marlin_safe
+ 
+         run_id = os.environ["SGLANG_RUN_ID"]
+ 
+@@ -231,6 +233,7 @@ class OffloaderV2(BaseOffloader):
+                 module=module,
+                 offloaders=self.offloaders,
+                 prefetch_step=self.prefetch_step,
++                marlin_safe=self.marlin_safe,
+             )
+ 
+         return all_modules
+@@ -247,12 +250,13 @@ class OffloaderV2(BaseOffloader):
+         return self.mode == "cpu"
+ 
+ 
+-def _hook_module_forward_for_offloader(index, module, offloaders, prefetch_step):
++def _hook_module_forward_for_offloader(index, module, offloaders, prefetch_step, marlin_safe=False):
+     def _on_forward_end():
+         offloaders[(index + prefetch_step) % len(offloaders)].start_onload()
+         offloaders[index].offload()
+ 
+-    _hook_module_forward_raw(
++    hook_fn = _hook_module_forward_marlin_safe if marlin_safe else _hook_module_forward_raw
++    hook_fn(
+         module,
+         on_forward_end=_on_forward_end,
+         get_parameter_and_buffer_dicts=lambda: offloaders[
+@@ -276,6 +280,39 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
+     module.forward = forward
+ 
+ 
++def _hook_module_forward_marlin_safe(module, on_forward_end, get_parameter_and_buffer_dicts):
++    """Marlin-safe forward hook: swaps param.data in-place instead of using
++    functional_call(). functional_call() breaks Marlin CUDA kernels because it
++    creates a shadow module with different data_ptr() addresses, while Marlin
++    accesses weights via raw CUDA pointers resolved during kernel launch."""
++    original_forward = module.forward
++
++    def forward(*args, **kwargs):
++        device_dicts = get_parameter_and_buffer_dicts()
++        saved_data = {}
++
++        for name, gpu_tensor in device_dicts.items():
++            parts = name.split(".")
++            obj = module
++            for part in parts[:-1]:
++                obj = getattr(obj, part)
++            param = getattr(obj, parts[-1])
++            saved_data[name] = (obj, parts[-1], param.data)
++            param.data = gpu_tensor
++
++        module.forward = original_forward
++        output = module(*args, **kwargs)
++
++        for name, (parent, attr_name, orig_data) in saved_data.items():
++            getattr(parent, attr_name).data = orig_data
++
++        on_forward_end()
++        module.forward = forward
++        return output
++
++    module.forward = forward
++
++
+ class _ModuleOffloader(ABC):
+     def __init__(
+         self,

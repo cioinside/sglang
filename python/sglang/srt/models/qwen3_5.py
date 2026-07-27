@@ -1376,6 +1376,12 @@ class Qwen3_5ForCausalLM(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
+            offloader_kwargs=dict(
+                submodule_accessor=lambda layer: layer.mlp.experts,
+                whitelist_param_names_creator=lambda module: [
+                    n for n, _ in module.named_parameters()
+                ],
+            ) if getattr(config, 'num_experts', 0) > 1 else None,
         )
 
         # Final normalization
