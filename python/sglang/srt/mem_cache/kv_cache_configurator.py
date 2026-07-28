@@ -1288,11 +1288,13 @@ class KVCacheConfigurator:
         )
         # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
         # buffers) for the full-attention layers, same as the SWA branch.
-        full_pool_class = (
-            MHATokenToKVPoolMXFP8
-            if get_model().kv_cache_dtype == "mxfp8" and not self.use_mla_backend
-            else mha_pool_class
-        )
+        kv_cache_dtype_str = get_model().kv_cache_dtype
+        if kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend:
+            full_pool_class = MHATokenToKVPoolMXFP8
+        elif kv_cache_dtype_str == "q4_0" and not self.use_mla_backend:
+            full_pool_class = MHATokenToKVPoolQ40
+        else:
+            full_pool_class = mha_pool_class
         token_to_kv_pool = HybridLinearKVPool(
             page_size=self.server_args.page_size,
             size=max_total_num_tokens,

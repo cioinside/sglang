@@ -32,6 +32,7 @@ class Q40KVQuantizeUtil:
         unpacked = unpacked.view(b, m, n)
         num_blocks = m * n // Q40KVQuantizeUtil.BLOCK_SIZE
         reshaped = unpacked.view(b, num_blocks, Q40KVQuantizeUtil.BLOCK_SIZE)
-        scale = scale_factors.view(b, num_blocks, 1).float()
-        dequantized = (reshaped.float() - 8.0) * scale
-        return dequantized.view(b, m, n).to(dtype)
+        reshaped_dt = reshaped.to(dtype)
+        scale = scale_factors.view(b, num_blocks, 1).to(dtype)
+        dequantized = (reshaped_dt - 8.0) * scale
+        return dequantized.view(b, m, n)
