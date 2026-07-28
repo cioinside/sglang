@@ -22,9 +22,9 @@ sgl_kernel CRITICAL: Could not load any common_ops library!
 GPU Info: compute_capability = 86
 ```
 
-Additionally, SGLang's CuDNN compatibility check blocks text-only LLM serving (the Conv3d bug only affects multimodal models), and the Qwen3.5 MoE weight loader crashes on AWQ-quantized checkpoints with mixed key formats.
+Additionally, SGLang's CuDNN compatibility check blocks text-only LLM serving (the Conv3d bug only affects multimodal models), and the Qwen3.5 MoE weight loader crashes on AWQ-quantized checkpoints with mixed key formats. Memory-constrained Ampere cards (e.g., 2× RTX 3060 12GB serving Qwen3.6-35B-A3B) also cannot fit long contexts because the bf16 KV cache grows linearly with sequence length — this fork adds a **Q4_0 quantized KV cache** that packs K/V at ~3.5× smaller per-token cost, multiplying available context without any model weight changes.
 
-## Solutions (3 Patches)
+## Solutions (4 Patches)
 
 ### Patch 1: `sgl-kernel` SM86→SM90 Binary Fallback
 
@@ -56,6 +56,54 @@ Relaxes the Qwen3.5 MoE weight loader to skip any parameter not found in `params
 
 **Effect**: AWQ-quantized Qwen3.5 MoE models load successfully in SGLang.
 
+### Patch 4: Q4_0 KV Cache Quantization
+
+**Files**:
+- `python/sglang/srt/layers/quantization/q40_tensor.py` (new) — `Q40KVQuantizeUtil` (batched quantize/dequantize for GGUF Q4_0 format: 32 values/block, 4-bit packed data + fp16 scales)
+- `python/sglang/srt/layers/attention/ops/q40_decode.py` (new) — Q4_0-aware KV-cache **get** path (dequantize → attention K/V)
+- `python/sglang/srt/layers/attention/ops/q40_store.py` (new) — Q4_0-aware KV-cache **set** path (attention → quantize → store)
+- `python/sglang/srt/mem_cache/memory_pool.py` — `MHATokenToKVPoolQ40` (Q4_0 pool class); `HybridLinearKVPool` dispatches on `kv_cache_dtype_str`
+- `python/sglang/srt/mem_cache/kv_cache_dtype.py` — accepts `"q4_0"` (storage dtype stays bf16; Q4_0 applies at set/get)
+- `python/sglang/srt/mem_cache/kv_cache_configurator.py` + `model_executor/pool_configurator.py` — Q4_0 cell-size accounting
+- `python/sglang/srt/server_args.py` — adds `"q4_0"` to `kv_cache_dtype` choices
+
+**Format**: GGUF Q4_0 — 32-element blocks, each block stores one fp16 scale plus 32 nibbles (4 bits each) packed into 16 bytes. Per-token storage ≈ `(head_dim + v_head_dim) × num_layers × num_kv_heads × 18 / 32` bytes for K (and same for V), versus bf16's `(head_dim + v_head_dim) × num_layers × num_kv_heads × 2`.
+
+**Effect**: `--kv-cache-dtype q4_0` enables the Q4_0 pool. K and V are quantized on write (set) and dequantized on read (get), so the runtime KV footprint drops ~3.5× vs bf16. On Qwen3.6-35B-A3B (hybrid SWA + Mamba) on 2× RTX 3060 12GB, this raises the maximum context from ~16.6K tokens (bf16) to ~59K tokens (auto-sized), with no model weight changes required.
+
+#### Performance (Qwen3.6-35B-A3B, 2× RTX 3060 12GB, TP=2, Q4_0 + CUDA graphs)
+
+| KV dtype | `--max-total-tokens` | K=V size (each) | Decode tok/s (500-gen) | Notes |
+|----------|----------------------|-----------------|------------------------|-------|
+| bf16     | 16,592 (auto)        | 0.08 GB         | 87.9                   | baseline |
+| Q4_0     | 16,000               | 0.02 GB         | 58.2                   | 4× smaller pool, 66% of bf16 speed |
+| Q4_0     | 24,000               | 0.03 GB         | ~58                    | 44% more context vs bf16 |
+| Q4_0     | 33,000               | 0.04 GB         | ~58                    | 99% more context vs bf16 |
+
+Decode throughput at 50 / 200 / 500 generated tokens (CUDA graphs enabled):
+- Q4_0: 36.5 / 57.2 / 58.2 tok/s
+- bf16: 52.8 / 83.5 / 87.9 tok/s
+
+Long-context stability: a 6.4K-token prompt + 6.4K-token generation through a full Q4_0 round-trip produces coherent output (90 distinct chars, 0 CJK garbage). No OOM.
+
+CUDA Graph capture works at `bs=[1]` on the first request (~3.2 s capture).
+
+#### Three Q4_0 bugs fixed during bring-up
+
+1. **`HybridLinearKVPool` hardcoded the bf16 pool class.** Hybrid SWA + Mamba models always took this path, which unconditionally used `MHATokenToKVPool` (bf16 buffers). With Q4_0 requested, the pool still allocated bf16, leading to OOM. Fix: `HybridLinearKVPool` now dispatches on `kv_cache_dtype_str` and selects `MHATokenToKVPoolQ40` when `"q4_0"`.
+
+2. **`set_num_tokens_hybrid_swa` used bf16 per-token costs.** The function recomputed `total_memory` from `max_total_num_tokens` using bf16 cell size; with Q4_0 cell size (much smaller), the recomputed memory was inflated ~7×, leading to oversized `full_max_total_num_tokens`. Fix: use Q4_0 packed-format per-token costs (`2 × (n × (k//2) + (n×k//32) × 2)`) when `kv_cache_dtype == "q4_0"`.
+
+3. **Missing `+ 8` offset in `batched_quantize`.** The quantizer did `q = round(value / scale); clamp(0, 15)`, which clamped every negative quantized value to 0. Dequant `(q − 8) × scale` then produced wildly wrong values for all negative K/V entries — manifesting as garbage tokens. Fix: `q = q + 8` after rounding, before clamping. This maps the symmetric range `[−7.5, +7.5]` to unsigned `[0, 15]` — the GGUF Q4_0 convention.
+
+**Bonus**: `batched_dequantize` originally used `float32` intermediates (~90 MB per layer), which OOMed during inference. Switched to `bf16` intermediates (~45 MB) — fits in the ~0.55 GB headroom on a 12 GB card.
+
+#### Caveats
+
+- Currently enabled for hybrid SWA + Mamba models (the model that prompted this work). The pure-MHA path (`MHATokenToKVPool` vs `MHATokenToKVPoolQ40`) is wired through the same `configure_kv_cache_dtype` and pool-configurator paths, but has not been benchmarked end-to-end on a non-hybrid checkpoint.
+- Auto-sizing (`profile_max_num_token` returns ~59K) does **not** fit during inference: the full-pool dequant requires enough headroom for ~45 MB bf16 intermediates per layer. On 2× 12 GB cards, `--max-total-tokens 16000–33000` works comfortably; the full 59 K auto-size OOMs on 12 GB cards during inference (would require direct Q4_0 attention kernels that avoid materializing the full dequantized buffer).
+- Decode throughput is ~66% of bf16 because of the quantize/dequant on every KV access. Prefill is unaffected (Q4_0 is applied to the cache, not to activations).
+
 ## Applicability
 
 | Hardware | Status |
@@ -68,8 +116,9 @@ Relaxes the Qwen3.5 MoE weight loader to skip any parameter not found in `params
 
 ## Known Limitations
 
-- **Memory pressure on 12GB cards**: Large MoE models (e.g., Qwen3.6-35B-A3B AWQ at ~10.7 GB per GPU with TP=2) may fail CUDA graph capture due to insufficient VRAM for KV cache + CUDA graph workspace. Consider `--mem-fraction-static 0.95` or reducing context length.
+- **Memory pressure on 12GB cards**: Large MoE models (e.g., Qwen3.6-35B-A3B AWQ at ~10.7 GB per GPU with TP=2) may fail CUDA graph capture due to insufficient VRAM for KV cache + CUDA graph workspace. Consider `--mem-fraction-static 0.95`, reducing context length, or using `--kv-cache-dtype q4_0` (Patch 4) to trade ~34% decode throughput for ~3.5× larger context on the same hardware.
 - **SM86 uses SM90 fast-math binaries**: Minor numerical differences possible vs. native SM86 compilation, but functionally correct for inference.
+- **Q4_0 decode is ~66% of bf16 speed**: Every KV read requires a dequantize; this is a property of the current implementation, not a fundamental limit.
 
 ## How to Apply (Standalone)
 
@@ -107,6 +156,28 @@ python -m sglang.launch_server \
   --quantization awq_marlin \
   --trust-remote-code --dtype half \
   --disable-custom-all-reduce
+```
+
+### Q4_0 KV cache (Patch 4) — long context on memory-constrained cards
+
+Same install as above (the Q4_0 implementation is built into the fork). Launch with `--kv-cache-dtype q4_0` and an explicit `--max-total-tokens` between 16 K and 33 K (the full ~59 K auto-size OOMs on 12 GB cards during inference):
+
+```bash
+python -m sglang.launch_server \
+  --model-path QuantTrio/Qwen3.6-35B-A3B-AWQ \
+  --tensor-parallel-size 2 \
+  --quantization awq_marlin \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --disable-custom-all-reduce \
+  --max-running-requests 1 \
+  --context-length 8192 \
+  --disable-radix-cache \
+  --chunked-prefill-size 1024 \
+  --skip-server-warmup \
+  --mem-fraction-static 0.95 \
+  --kv-cache-dtype q4_0 \
+  --max-total-tokens 16000
 ```
 
 ## Patch Files

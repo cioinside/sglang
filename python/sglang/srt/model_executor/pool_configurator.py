@@ -336,21 +336,29 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._sliding_window_size = kvc.sliding_window_size
         self._page_size = kvc.page_size
 
-        # Full layer per-token memory (bytes)
-        self._full_per_token = (
-            model_config.get_num_kv_heads(tp_size)
-            * (model_config.head_dim + model_config.v_head_dim)
-            * kv_size
-        )
+        kv_cache_dtype_str = get_model().kv_cache_dtype
 
-        # SWA layer per-token memory (bytes)
-        self._swa_per_token = (
-            model_config.get_swa_num_kv_heads(tp_size)
-            * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-            * kv_size
-        )
+        if kv_cache_dtype_str == "q4_0":
+            Q40_BLOCK = 32
+            n_full = model_config.get_num_kv_heads(tp_size)
+            k_full = model_config.head_dim
+            self._full_per_token = 2 * (n_full * (k_full // 2) + (n_full * k_full // Q40_BLOCK) * 2)
+            n_swa = model_config.get_swa_num_kv_heads(tp_size)
+            k_swa = model_config.swa_head_dim
+            self._swa_per_token = 2 * (n_swa * (k_swa // 2) + (n_swa * k_swa // Q40_BLOCK) * 2)
+        else:
+            self._full_per_token = (
+                model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+                * kv_size
+            )
+            self._swa_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * kv_size
+            )
 
-        if get_model().kv_cache_dtype == "mxfp8":
+        if kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
                 model_config.get_num_kv_heads(tp_size)
