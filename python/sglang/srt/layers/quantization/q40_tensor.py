@@ -11,9 +11,10 @@ class Q40KVQuantizeUtil:
         abs_vals = reshaped.abs()
         block_max = abs_vals.max(dim=-1, keepdim=True).values
         eps = 1e-6
-        scale = torch.clamp(block_max / (7.0 + eps), min=eps)
+        scale = torch.clamp(block_max / 7.5, min=eps)
         scaled = reshaped / scale
         q = torch.round(scaled).to(torch.int32)
+        q = q + 8
         q = torch.clamp(q, 0, 15)
         # Reshape back to [B, M, N] before packing
         q = q.view(b, m, n)
