@@ -179,6 +179,7 @@ if _BACKEND_AVAILABLE:
             self.decode_chunk = 512
             self._token_to_kv_pool = None
             self._req_to_token_pool = None
+            self._fallback_warned = False
 
         @property
         def token_to_kv_pool(self):
@@ -198,7 +199,7 @@ if _BACKEND_AVAILABLE:
             pool = self.runner.token_to_kv_pool
             return pool is not None and hasattr(pool, "get_q4_kv_buffers")
 
-        def _try_q40_decode(self, q, k, v, layer, forward_batch):
+        def _try_q40_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
             """Q4_0 Triton kernel path for bs=1 decode.
 
             Pool layout: get_q4_kv_buffers returns (k_packed, k_scale,
@@ -210,33 +211,40 @@ if _BACKEND_AVAILABLE:
 
             pool = self.runner.token_to_kv_pool
             try:
-                from sglang.srt.mem_cache.memory_pool import KVWriteLoc, unwrap_write_loc
-                from sglang.srt.layers.radix_attention import RadixAttention
+                from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not getattr(layer, "is_cross_attention", False)
-                    else getattr(forward_batch, "encoder_out_cache_loc", None)
-                )
-                if cache_loc is not None and k is not None and v is not None:
-                    pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, None),
-                        k,
-                        v,
+                if save_kv_cache:
+                    cache_loc = (
+                        forward_batch.out_cache_loc
+                        if not getattr(layer, "is_cross_attention", False)
+                        else getattr(forward_batch, "encoder_out_cache_loc", None)
                     )
+                    if cache_loc is not None and k is not None and v is not None:
+                        pool.set_kv_buffer(
+                            layer,
+                            KVWriteLoc(cache_loc, None),
+                            k,
+                            v,
+                        )
 
                 q_t = q[0].transpose(0, 1).contiguous()
                 k_q4, k_scale, v_q4, v_scale = pool.get_q4_kv_buffers(layer.layer_id)
                 S = k_q4.shape[0]
                 if S == 0:
-                    return q.new_empty(q.shape[0], q.shape[1] * q.shape[-1])
+                    return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
                 out_hd = q40_attention_decode(
                     q_t, k_q4, k_scale, v_q4, v_scale, chunk=self.decode_chunk
                 )
                 return out_hd.transpose(0, 1).unsqueeze(0)
-            except Exception:
+            except Exception as e:
+                if not self._fallback_warned:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Q4_0 decode path failed, falling back to flashinfer: %s",
+                        type(e).__name__,
+                    )
+                    self._fallback_warned = True
                 return None
 
         def init_forward_metadata(self, forward_batch):
@@ -279,7 +287,7 @@ if _BACKEND_AVAILABLE:
                 )
 
         def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
-            out = self._try_q40_decode(q, k, v, layer, forward_batch)
+            out = self._try_q40_decode(q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache)
             if out is not None:
                 return out
             return self.full_attn_backend.forward_decode(
