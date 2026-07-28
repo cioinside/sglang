@@ -446,3 +446,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("q4_aware")
+def create_q4_aware_backend(runner):
+    from sglang.srt.layers.attention.q4_attention import Q40AttentionBackend
+
+    return Q40AttentionBackend(runner)

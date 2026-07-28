@@ -3146,6 +3146,13 @@ class MHATokenToKVPoolQ40(MHATokenToKVPool):
         orig_shape = (cache_v_q40.shape[0], self.head_num, self.v_head_dim)
         return Q40KVQuantizeUtil.batched_dequantize(cache_v_q40, cache_v_scale, orig_shape)
 
+    def get_q4_kv_buffers(self, layer_id: int):
+        k_packed = self.k_buffer[layer_id - self.start_layer]
+        k_scale = self.k_scale_buffer[layer_id - self.start_layer]
+        v_packed = self.v_buffer[layer_id - self.start_layer]
+        v_scale = self.v_scale_buffer[layer_id - self.start_layer]
+        return k_packed, k_scale, v_packed, v_scale
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -3833,6 +3840,13 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def get_q4_kv_buffers(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        if hasattr(self.full_kv_pool, "get_q4_kv_buffers"):
+            return self.full_kv_pool.get_q4_kv_buffers(layer_id)
+        return None
 
     def get_raw_kv_buffer(
         self, layer_id: int
