@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MHATokenToKVPoolMXFP8,
+    MHATokenToKVPoolQ40,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
@@ -1334,8 +1335,11 @@ class KVCacheConfigurator:
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
-        if get_model().kv_cache_dtype == "mxfp8":
+        kv_cache_dtype_str = get_model().kv_cache_dtype
+        if kv_cache_dtype_str == "mxfp8":
             pool_cls = MHATokenToKVPoolMXFP8
+        elif kv_cache_dtype_str == "q4_0":
+            pool_cls = MHATokenToKVPoolQ40
         else:
             pool_cls = (
                 NoOpMHATokenToKVPool

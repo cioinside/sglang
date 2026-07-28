@@ -3059,6 +3059,137 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class MHATokenToKVPoolQ40(MHATokenToKVPool):
+    """MHA KV cache pool with Q4_0 quantization.
+
+    Q4_0 format (GGUF / llama.cpp compatible):
+      - 32 values per block, 1 fp16 scale per block
+      - Storage: 4 bytes (packed uint8) + 2 bytes (fp16 scale) = 6 bytes per 32 values
+      - Compression: 10.67x vs bf16 (0.1875 bytes/value vs 2 bytes/value)
+      - Dequant: value = (q[i] - 8) * scale
+
+    Buffers:
+      - k_buffer / v_buffer: [size, head_num, head_dim // 2] uint8 (packed 2 values/byte)
+      - k_scale_buffer / v_scale_buffer: [size, head_num * head_dim // 32] fp16 (1 scale per 32 values)
+    """
+
+    Q40_BLOCK_SIZE = 32
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                n = self.head_num
+                k = self.head_dim
+
+                self.store_dtype = torch.uint8
+                self.k_buffer = [
+                    torch.zeros(
+                        (m, n, k // 2),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (m, n, k // 2),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                num_scale_blocks = (n * k) // self.Q40_BLOCK_SIZE
+                self.k_scale_buffer = [
+                    torch.zeros(
+                        (m, num_scale_blocks),
+                        dtype=torch.float16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_scale_buffer = [
+                    torch.zeros(
+                        (m, num_scale_blocks),
+                        dtype=torch.float16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_scale_buffer
+        del self.v_scale_buffer
+
+    def _get_key_buffer(self, layer_id: int):
+        cache_k_q40 = self.k_buffer[layer_id - self.start_layer]
+        cache_k_scale = self.k_scale_buffer[layer_id - self.start_layer]
+
+        from sglang.srt.layers.quantization.q40_tensor import Q40KVQuantizeUtil
+
+        orig_shape = (cache_k_q40.shape[0], self.head_num, self.head_dim)
+        return Q40KVQuantizeUtil.batched_dequantize(cache_k_q40, cache_k_scale, orig_shape)
+
+    def _get_value_buffer(self, layer_id: int):
+        cache_v_q40 = self.v_buffer[layer_id - self.start_layer]
+        cache_v_scale = self.v_scale_buffer[layer_id - self.start_layer]
+
+        from sglang.srt.layers.quantization.q40_tensor import Q40KVQuantizeUtil
+
+        orig_shape = (cache_v_q40.shape[0], self.head_num, self.v_head_dim)
+        return Q40KVQuantizeUtil.batched_dequantize(cache_v_q40, cache_v_scale, orig_shape)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        loc, _, _ = unwrap_write_loc(loc_info)
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-Q40)")
+
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        from sglang.srt.layers.quantization.q40_tensor import Q40KVQuantizeUtil
+
+        cache_k_q40, cache_k_q40_sf, _ = Q40KVQuantizeUtil.batched_quantize(cache_k)
+        cache_v_q40, cache_v_q40_sf, _ = Q40KVQuantizeUtil.batched_quantize(cache_v)
+
+        if get_is_capture_mode() and self.alt_stream is not None:
+            current_stream = self.device_module.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            self.k_buffer[layer_id - self.start_layer][loc] = cache_k_q40
+
+            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_q40_sf
+            with self.device_module.stream(self.alt_stream):
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v_q40
+
+                self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_q40_sf
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            self.k_buffer[layer_id - self.start_layer][loc] = cache_k_q40
+            self.v_buffer[layer_id - self.start_layer][loc] = cache_v_q40
+
+            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_q40_sf
+            self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_q40_sf
+
+
 class PageMajorMHATokenToKVPool(MHATokenToKVPool):
     """MHA pool with the page-major (layer-major within a page) page-granularity envelope layout.
 
