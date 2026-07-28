@@ -453,3 +453,12 @@ def create_q4_aware_backend(runner):
     from sglang.srt.layers.attention.q4_attention import Q40AttentionBackend
 
     return Q40AttentionBackend(runner)
+
+
+@register_attention_backend("q4_hybrid")
+def create_q4_hybrid_backend(runner):
+    from sglang.srt.layers.attention.hybrid_q4_attention import (
+        HybridQ4FlashInferAttnBackend,
+    )
+
+    return HybridQ4FlashInferAttnBackend(runner)

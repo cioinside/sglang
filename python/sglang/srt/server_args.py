@@ -225,6 +225,8 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "q4_aware",
+    "q4_hybrid",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
