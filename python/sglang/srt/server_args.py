@@ -5541,6 +5541,12 @@ class ServerArgs:
         )
 
         # Split-backend override + default fill.
+        if self.kv_cache_dtype == "q4_0" and self.attention_backend is None:
+            self.attention_backend = "q4_hybrid"
+            logger.info(
+                "Auto-selected q4_hybrid attention backend for Q4_0 KV cache."
+            )
+
         run_post_process_pass(self, _attention_backend_default)
 
         # Torch native and flex attention backends
