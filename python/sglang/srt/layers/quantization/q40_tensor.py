@@ -26,14 +26,12 @@ class Q40KVQuantizeUtil:
     @staticmethod
     def batched_dequantize(quant_tensor, scale_factors, orig_shape, dtype=torch.bfloat16):
         b, m, n = orig_shape
-        n_half = n // 2
-        low = quant_tensor & 0x0F
-        high = (quant_tensor >> 4) & 0x0F
-        unpacked = torch.stack([low, high], dim=-1)
-        unpacked = unpacked.view(b, m, n)
         num_blocks = m * n // Q40KVQuantizeUtil.BLOCK_SIZE
-        reshaped = unpacked.view(b, num_blocks, Q40KVQuantizeUtil.BLOCK_SIZE)
-        reshaped_dt = reshaped.to(dtype)
+        BLOCK_SIZE = Q40KVQuantizeUtil.BLOCK_SIZE
+        unpacked = torch.empty(b, m, n, dtype=torch.uint8, device=quant_tensor.device)
+        unpacked[:, :, 0::2] = quant_tensor & 0x0F
+        unpacked[:, :, 1::2] = (quant_tensor >> 4) & 0x0F
+        reshaped_dt = unpacked.view(b, num_blocks, BLOCK_SIZE).to(dtype)
         scale = scale_factors.view(b, num_blocks, 1).to(dtype)
-        dequantized = (reshaped_dt - 8.0) * scale
-        return dequantized.view(b, m, n)
+        reshaped_dt.sub_(8.0).mul_(scale)
+        return reshaped_dt.view(b, m, n)
