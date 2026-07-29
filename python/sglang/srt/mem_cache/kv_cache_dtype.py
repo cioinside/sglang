@@ -55,7 +55,10 @@ def configure_kv_cache_dtype(
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
     elif server_args_kv_cache_dtype == "q4_0":
-        kv_cache_dtype = torch.bfloat16
+        # Q4_0 pool dequantizes to model_dtype (fp16 for Qwen3.6-35B-A3B-AWQ).
+        # Using bf16 here causes flashinfer to expect bf16 KV while dequant
+        # produces fp16 → mixed-precision attention → garbage.
+        kv_cache_dtype = model_dtype
     elif server_args_kv_cache_dtype == "fp4_e2m1":
         raise ValueError(
             "--kv-cache-dtype=fp4_e2m1 is deprecated. "
