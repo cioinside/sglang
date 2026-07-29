@@ -215,7 +215,17 @@ if _BACKEND_AVAILABLE:
                         pool.set_kv_buffer(layer, cache_loc, k, v)
 
                 k_q4, k_scale, v_q4, v_scale = pool.get_q4_kv_buffers(layer.layer_id)
-                S = k_q4.shape[0]
+
+                # Use actual seq_len (number of valid tokens), not the full
+                # buffer size (max_total_tokens).  Empty/uninitialised slots
+                # have scale=0 → dequant to 0 → q@0=0, which dominates the
+                # online softmax and produces garbage attention.
+                seq_len = forward_batch.seq_lens[0].item()
+                k_q4 = k_q4[:seq_len]
+                k_scale = k_scale[:seq_len]
+                v_q4 = v_q4[:seq_len]
+                v_scale = v_scale[:seq_len]
+                S = seq_len
                 if S == 0:
                     return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
