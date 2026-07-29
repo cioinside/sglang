@@ -3136,8 +3136,8 @@ class MHATokenToKVPoolQ40(MHATokenToKVPool):
 
         orig_shape = (cache_k_q40.shape[0], self.head_num, self.head_dim)
         return Q40KVQuantizeUtil.batched_dequantize(
-            cache_k_q40, cache_k_scale, orig_shape
-        ).to(torch.float16)
+            cache_k_q40, cache_k_scale, orig_shape, dtype=torch.float16
+        )
 
     def _get_value_buffer(self, layer_id: int):
         cache_v_q40 = self.v_buffer[layer_id - self.start_layer]
@@ -3147,8 +3147,8 @@ class MHATokenToKVPoolQ40(MHATokenToKVPool):
 
         orig_shape = (cache_v_q40.shape[0], self.head_num, self.v_head_dim)
         return Q40KVQuantizeUtil.batched_dequantize(
-            cache_v_q40, cache_v_scale, orig_shape
-        ).to(torch.float16)
+            cache_v_q40, cache_v_scale, orig_shape, dtype=torch.float16
+        )
 
     def get_q4_kv_buffers(self, layer_id: int):
         k_packed = self.k_buffer[layer_id - self.start_layer]

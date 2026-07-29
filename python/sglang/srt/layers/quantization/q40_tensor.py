@@ -13,6 +13,7 @@ try:
         BYTES_PER_B: tl.constexpr,
         OUT_PER_B: tl.constexpr,
         BLOCK: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
     ):
         pid = tl.program_id(0)
         b = pid // NUM_BLOCKS
@@ -31,9 +32,9 @@ try:
         high = (packed >> 4) & 0x0F
         q = tl.where(is_high, high, low)
 
-        scale = tl.load(s_ptr).to(tl.bfloat16)
-        q_bf16 = q.to(tl.bfloat16)
-        out_val = (q_bf16 - 8.0) * scale
+        scale = tl.load(s_ptr).to(OUT_DTYPE)
+        q_dt = q.to(OUT_DTYPE)
+        out_val = (q_dt - 8.0) * scale
 
         tl.store(o_ptr + n_offs, out_val)
 
@@ -69,7 +70,7 @@ class Q40KVQuantizeUtil:
         b, m, n = orig_shape
         num_blocks = m * n // Q40KVQuantizeUtil.BLOCK_SIZE
 
-        if _TRITON_AVAILABLE and dtype == torch.bfloat16:
+        if _TRITON_AVAILABLE and dtype in (torch.bfloat16, torch.float16):
             try:
                 out = torch.empty(b, m, n, dtype=dtype, device=quant_tensor.device)
                 grid = (b * num_blocks,)
@@ -77,6 +78,7 @@ class Q40KVQuantizeUtil:
                     quant_tensor, scale_factors, out,
                     num_blocks, m * n // 2, m * n,
                     BLOCK=Q40KVQuantizeUtil.BLOCK_SIZE,
+                    OUT_DTYPE=dtype,
                     num_warps=1,
                 )
                 return out
