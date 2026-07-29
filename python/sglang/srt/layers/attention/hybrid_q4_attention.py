@@ -2,15 +2,12 @@
 
 Routes by forward mode:
 - extend (prefill): flashinfer (paged attention, reads dequantized bf16)
-- decode:
-  - bs=1 with Q4_0 pool: fused dequant+attention Triton kernel (Q4_0 packed)
-  - otherwise: flashinfer (multi-batch decode path)
-
-Memory benefit: the bs=1 decode path reads Q4_0 packed buffers directly,
-avoiding the on-the-fly dequant that flashinfer's get_kv_buffer triggers.
-The bf16 workspace that flashinfer normally materializes is not needed on
-the decode path; only the packed Q4_0 pool is held for decode attention.
+- decode (bs=1):
+    Q4_0 Triton kernel that reads Q4_0 packed buffers directly
+    (avoids the on-the-fly dequant that flashinfer triggers on the Q4_0
+    pool); falls back to flashinfer for multi-batch.
 """
+import os as _os
 import torch
 import triton
 import triton.language as tl
@@ -126,116 +123,6 @@ except Exception:
     _q40_decode_attn_kernel = None
 
 
-try:
-    @triton.jit
-    def _q40_decode_attn_kernel_batched(
-        Q_ptr,
-        K_q4_ptr,
-        K_scale_ptr,
-        V_q4_ptr,
-        V_scale_ptr,
-        O_ptr,
-        token_indices_ptr,
-        cu_seqlens_ptr,
-        H: tl.constexpr,
-        D: tl.constexpr,
-        D_PAD: tl.constexpr,
-        BLOCK: tl.constexpr,
-        CHUNK: tl.constexpr,
-        SCALE: tl.constexpr,
-        H_STRIDE_TOK: tl.constexpr,
-        H_STRIDE_SCALE: tl.constexpr,
-    ):
-        batch = tl.program_id(0)
-        h = tl.program_id(1)
-
-        seq_start = tl.load(cu_seqlens_ptr + batch)
-        seq_end = tl.load(cu_seqlens_ptr + batch + 1)
-
-        NUM_BLOCKS = D // BLOCK
-        BYTES_PER_TOKEN_HEAD = D // 2
-
-        d_offs = tl.arange(0, D_PAD)
-        d_mask = d_offs < D
-        q = tl.load(Q_ptr + batch * (H * D) + h * D + d_offs, mask=d_mask, other=0.0)
-
-        m_i = float('-inf')
-        l_i = 0.0
-
-        zero_acc = tl.zeros((D_PAD,), dtype=tl.float32)
-        acc_offs = h * D + d_offs
-        tl.store(O_ptr + batch * (H * D) + acc_offs, zero_acc.to(tl.bfloat16), mask=d_mask)
-
-        for s in range(seq_start, seq_end):
-            tok_idx = tl.load(token_indices_ptr + s)
-            token_base = tok_idx * H_STRIDE_TOK
-            scale_base = tok_idx * H_STRIDE_SCALE
-
-            k_base = K_q4_ptr + token_base + h * BYTES_PER_TOKEN_HEAD
-            v_base = V_q4_ptr + token_base + h * BYTES_PER_TOKEN_HEAD
-            ks_base = K_scale_ptr + scale_base + h * NUM_BLOCKS
-            vs_base = V_scale_ptr + scale_base + h * NUM_BLOCKS
-
-            score = tl.zeros((), dtype=tl.float32)
-            for blk in range(NUM_BLOCKS):
-                byte_idx = tl.arange(0, BLOCK // 2)
-                n_offs = tl.arange(0, BLOCK)
-                packed_off = n_offs // 2
-                is_high = (n_offs % 2) != 0
-
-                k_packed = tl.load(k_base + blk * (BLOCK // 2) + packed_off)
-                k_low = k_packed & 0x0F
-                k_high = (k_packed >> 4) & 0x0F
-                k_vals = tl.where(is_high, k_high, k_low)
-                k_scale_v = tl.load(ks_base + blk).to(tl.bfloat16)
-                k_block = (k_vals.to(tl.bfloat16) - 8.0) * k_scale_v
-
-                q_block = tl.load(Q_ptr + batch * (H * D) + h * D + blk * BLOCK + n_offs)
-                score += tl.sum(q_block.to(tl.float32) * k_block.to(tl.float32))
-
-            score = score * SCALE
-
-            m_new = tl.maximum(m_i, score)
-            alpha = tl.exp(m_i - m_new)
-            beta = tl.exp(score - m_new)
-            l_i = l_i * alpha + beta
-
-            for blk in range(NUM_BLOCKS):
-                n_offs = tl.arange(0, BLOCK)
-                packed_off = n_offs // 2
-                is_high = (n_offs % 2) != 0
-
-                v_packed = tl.load(v_base + blk * (BLOCK // 2) + packed_off)
-                v_low = v_packed & 0x0F
-                v_high = (v_packed >> 4) & 0x0F
-                v_vals = tl.where(is_high, v_high, v_low)
-                v_scale_v = tl.load(vs_base + blk).to(tl.bfloat16)
-                v_block = (v_vals.to(tl.bfloat16) - 8.0) * v_scale_v
-
-                cur_off = batch * (H * D) + h * D + blk * BLOCK + n_offs
-                old = tl.load(O_ptr + cur_off).to(tl.float32)
-                new_val = old * alpha + beta * v_block.to(tl.float32)
-                tl.store(O_ptr + cur_off, new_val.to(tl.bfloat16))
-
-            m_i = m_new
-
-        inv_l = 1.0 / l_i
-        for blk in range(NUM_BLOCKS):
-            n_offs = tl.arange(0, BLOCK)
-            cur_off = batch * (H * D) + h * D + blk * BLOCK + n_offs
-            cur = tl.load(O_ptr + cur_off).to(tl.float32)
-            tl.store(O_ptr + cur_off, (cur * inv_l).to(tl.bfloat16))
-
-    _Q40_BATCHED_KERNEL_AVAILABLE = True
-except Exception:
-    _Q40_BATCHED_KERNEL_AVAILABLE = False
-    _q40_decode_attn_kernel_batched = None
-
-
-import os as _os
-_Q40_BATCHED_ENABLED = _os.environ.get("SGLANG_Q4_BATCHED_DECODE", "0") == "1"
-
-
 def _next_pow2(n):
     p = 1
     while p < n:
@@ -264,42 +151,6 @@ def q40_attention_decode(q, k_q4, k_scale, v_q4, v_scale, chunk=512):
     _q40_decode_attn_kernel[grid](
         q, k_q4, k_scale, v_q4, v_scale, out,
         S, H, D=D, D_PAD=D_PAD, BLOCK=32, CHUNK=chunk, SCALE=scale, num_warps=1,
-    )
-    return out
-
-
-def q40_attention_decode_batched(
-    q, k_q4, k_scale, v_q4, v_scale,
-    token_indices, cu_seqlens, B,
-    chunk=512,
-):
-    """Multi-batch paged decode attention reading Q4_0 packed buffers.
-
-    Args:
-        q: (B, H, D) bf16 query
-        k_q4, v_q4: (max_size, H, D//2) uint8 packed — full pool, indexed via token_indices
-        k_scale, v_scale: (max_size, H*D//32) fp16
-        token_indices: (sum_seqlen,) int32 — flat pool indices, concat of per-batch slots
-        cu_seqlens: (B+1,) int32 — cumulative sequence lengths
-        B: batch size
-    Returns:
-        (B, H, D) bf16 attention output
-    """
-    if not _Q40_BATCHED_KERNEL_AVAILABLE:
-        raise RuntimeError("Triton Q4_0 batched attention kernel not available")
-    H, D = q.shape[1], q.shape[2]
-    out = torch.zeros(B, H, D, dtype=torch.bfloat16, device=q.device)
-    D_PAD = _next_pow2(D)
-    scale = D ** -0.5
-    H_STRIDE_TOK = H * (D // 2)
-    H_STRIDE_SCALE = H * (D // 32)
-    grid = (B, H)
-    _q40_decode_attn_kernel_batched[grid](
-        q, k_q4, k_scale, v_q4, v_scale, out,
-        token_indices, cu_seqlens,
-        H=H, D=D, D_PAD=D_PAD, BLOCK=32, CHUNK=chunk, SCALE=scale,
-        H_STRIDE_TOK=H_STRIDE_TOK, H_STRIDE_SCALE=H_STRIDE_SCALE,
-        num_warps=1,
     )
     return out
 
@@ -346,41 +197,10 @@ if _BACKEND_AVAILABLE:
             pool = self.runner.token_to_kv_pool
             return pool is not None and hasattr(pool, "get_q4_kv_buffers")
 
-        def _build_ragged_indices(self, forward_batch, layer):
-            """Build (token_indices, cu_seqlens) for ragged-batch Q4_0 decode.
-
-            Uses req_to_token to gather per-request token slots in the Q4_0 pool,
-            concatenates into a flat index, and computes cumulative seq_lens.
-            """
-            req_pool = self.runner.req_to_token_pool
-            req_to_token = req_pool.req_to_token  # (max_req, max_seq) int32
-            req_indices = forward_batch.req_pool_indices  # (B,)
-            seq_lens = forward_batch.seq_lens  # (B,) int32
-
-            B = req_indices.shape[0]
-            device = req_to_token.device
-
-            max_seq = req_to_token.shape[1]
-            batch_tokens = req_to_token[req_indices]  # (B, max_seq) int32
-            positions = torch.arange(max_seq, device=device, dtype=torch.int32).unsqueeze(0)
-            valid_mask = positions < seq_lens.unsqueeze(1)
-
-            token_indices = batch_tokens[valid_mask]  # (sum_seqlen,)
-            cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=device)
-            cu_seqlens[1:] = torch.cumsum(seq_lens.to(torch.int32), dim=0)
-            return token_indices, cu_seqlens, B
-
         def _try_q40_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
-            """Q4_0 Triton kernel path for decode.
-
-            bs=1: contiguous-token kernel.
-            bs>1: ragged-batch kernel via req_to_token pool.
-            Falls back to flashinfer if conditions not met.
-            """
+            """bs=1 Q4_0 Triton kernel path. Falls back for multi-batch."""
             bs = q.shape[0]
-            if not self.q40_available or not self._q40_pool_active():
-                return None
-            if bs > 1 and (not _Q40_BATCHED_KERNEL_AVAILABLE or not _Q40_BATCHED_ENABLED):
+            if bs != 1 or not self.q40_available or not self._q40_pool_active():
                 return None
 
             pool = self.runner.token_to_kv_pool
@@ -395,40 +215,17 @@ if _BACKEND_AVAILABLE:
                         pool.set_kv_buffer(layer, cache_loc, k, v)
 
                 k_q4, k_scale, v_q4, v_scale = pool.get_q4_kv_buffers(layer.layer_id)
-
-                if bs == 1:
-                    S = k_q4.shape[0]
-                    if S == 0:
-                        return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                    H = layer.tp_q_head_num
-                    D = layer.head_dim
-                    if not self._shape_warned:
-                        import logging
-                        logging.getLogger(__name__).info(
-                            "Q4_0 decode shape: q.shape=%s, layer.tp_q_head_num=%d, layer.head_dim=%d, H*D=%d",
-                            list(q.shape), H, D, H * D,
-                        )
-                        self._shape_warned = True
-                    q_t = q[0].view(H, D).contiguous()
-                    out_hd = q40_attention_decode(
-                        q_t, k_q4, k_scale, v_q4, v_scale, chunk=self.decode_chunk
-                    )
-                    return out_hd.view(1, H * D)
-
-                token_indices, cu_seqlens, B = self._build_ragged_indices(forward_batch, layer)
-                sum_seqlen = int(token_indices.shape[0])
-                if sum_seqlen == 0:
+                S = k_q4.shape[0]
+                if S == 0:
                     return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
                 H = layer.tp_q_head_num
                 D = layer.head_dim
-                q_reshaped = q.view(B, H, D).contiguous()  # (B, H, D)
-
-                out = q40_attention_decode_batched(
-                    q_reshaped, k_q4, k_scale, v_q4, v_scale,
-                    token_indices, cu_seqlens, B, chunk=self.decode_chunk,
+                q_t = q[0].view(H, D).contiguous()
+                out_hd = q40_attention_decode(
+                    q_t, k_q4, k_scale, v_q4, v_scale, chunk=self.decode_chunk
                 )
-                return out.view(B, H * D)  # back to (B, hidden)
+                return out_hd.view(1, H * D)
             except Exception as e:
                 if not self._fallback_warned:
                     import logging
@@ -481,7 +278,9 @@ if _BACKEND_AVAILABLE:
                 )
 
         def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
-            out = self._try_q40_decode(q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache)
+            out = self._try_q40_decode(
+                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
+            )
             if out is not None:
                 return out
             return self.full_attn_backend.forward_decode(
@@ -501,5 +300,9 @@ if _BACKEND_AVAILABLE:
             if layer.attention_type == AttentionType.ENCODER_ONLY:
                 raise NotImplementedError("Encoder self-attention not supported")
             if forward_batch.forward_mode.is_decode():
-                return self.forward_decode(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
-            return self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
+                return self.forward_decode(
+                    q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+                )
+            return self.forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
