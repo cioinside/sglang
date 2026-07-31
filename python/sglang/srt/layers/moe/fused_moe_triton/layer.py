@@ -622,12 +622,14 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                if not is_bias and self.use_triton_kernels:
+                if not is_bias and self.use_triton_kernels and not self._uses_packed_qweights():
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
-                )
+                # Only narrow loaded_weight if it has the full (non-TP-partitioned) shape
+                if loaded_weight.shape[shard_dim] != shard_size:
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, shard_size * tp_rank, shard_size
+                    )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
         expert_data.copy_(loaded_weight)
@@ -693,11 +695,15 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not is_bias and not self.use_presharded_weights:
-                if self.use_triton_kernels:
+                if self.use_triton_kernels and not self._uses_packed_qweights():
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
-                )
+                # Only narrow if loaded_weight has more data than expert_data
+                # (TP-sharded qweight: [64, 2048] → [32, 2048]).
+                # Skip for scales/qzeros which are full-size on both ranks.
+                if loaded_weight.shape[shard_dim] != expert_data.shape[shard_dim]:
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, shard_size * tp_rank, shard_size
+                    )
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
@@ -901,6 +907,18 @@ class FusedMoE(torch.nn.Module):
                 shard_id=shard_id,
                 expert_id=physical_expert_id,
             )
+
+    def _uses_packed_qweights(self) -> bool:
+        """Check if the quantization method uses packed qweights.
+
+        Packed qweights (GPTQ/AWQ Marlin) use [in/pack, out] layout where
+        transpose(-2, -1) would break the narrow+copy in _load_w2/_load_w13.
+        """
+        return (
+            self.quant_config is not None
+            and hasattr(self.quant_config, "pack_factor")
+            and self.quant_config.pack_factor > 1
+        )
 
     def _weight_loader_physical(
         self,

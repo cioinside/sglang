@@ -12,12 +12,27 @@ Memory benefit: decode path reads Q4_0 packed buffers directly, avoiding the
 on-the-fly dequant that flashinfer's get_kv_buffer triggers. The bf16 workspace
 that flashinfer normally materializes is not needed on the decode path; only
 the packed Q4_0 pool is held for decode attention.
+
+Hadamard pre-rotation (SGLANG_Q40_HADAMARD=1): if enabled, K stored rotated
+(K @ H) and Q is rotated here (Q @ H) before attention. Since H is orthogonal,
+scores stay equivalent to un-rotated attention while quantization captures more
+information about the original K distribution (outlier-mass spread by H).
 """
 import os as _os
 
 import torch
 import triton
 import triton.language as tl
+
+try:
+    from sglang.srt.layers.quantization.q40_tensor import (
+        _get_hadamard as _q40_get_hadamard,
+    )
+    from sglang.srt.layers.quantization.q40_tensor import _hadamard_enabled
+    _HADAMARD_IMPORT_OK = True
+except Exception:
+    _HADAMARD_IMPORT_OK = False
+    _q40_get_hadamard = None
 
 try:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -37,6 +52,7 @@ try:
         V_scale_ptr,
         O_ptr,
         seq_len,
+        swa_start,
         H,
         D: tl.constexpr,
         D_PAD: tl.constexpr,
@@ -46,9 +62,12 @@ try:
         H_KV: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        chunks = tl.cdiv(seq_len, CHUNK)
+        # SWA: skip leading chunks before the sliding-window start.
+        # swa_start is the first KV index inside the window (0 = full attention).
+        eff_len = seq_len - swa_start
+        chunks = tl.cdiv(eff_len, CHUNK)
         h = pid // chunks
-        chunk_start = (pid % chunks) * CHUNK
+        chunk_start = swa_start + (pid % chunks) * CHUNK
         chunk_end = tl.minimum(chunk_start + CHUNK, seq_len)
 
         # GQA: map query head h to the shared KV head
@@ -144,6 +163,7 @@ try:
         O_ptr,
         token_indices_ptr,
         cu_seqlens_ptr,
+        window_size,
         H: tl.constexpr,
         D: tl.constexpr,
         D_PAD: tl.constexpr,
@@ -160,6 +180,13 @@ try:
 
         seq_start = tl.load(cu_seqlens_ptr + batch)
         seq_end = tl.load(cu_seqlens_ptr + batch + 1)
+
+        # SWA: per-batch offset into the sliding window.
+        # Tokens before (seq_start + swa_off) are outside the window.
+        swa_off = 0
+        if window_size > 0:
+            swa_off = tl.maximum(0, (seq_end - seq_start) - window_size)
+        win_start = seq_start + swa_off
 
         NUM_BLOCKS = D // BLOCK
         BYTES_PER_TOKEN_HEAD = D // 2
@@ -178,7 +205,7 @@ try:
         acc_offs = h * D + d_offs
         tl.store(O_ptr + batch * (H * D) + acc_offs, zero_acc.to(tl.bfloat16), mask=d_mask)
 
-        for s in range(seq_start, seq_end):
+        for s in range(win_start, seq_end):
             tok_idx = tl.load(token_indices_ptr + s)
             token_base = tok_idx * H_STRIDE_TOK
             scale_base = tok_idx * H_STRIDE_SC
@@ -245,6 +272,13 @@ except Exception:
 
 _Q40_BATCHED_ENABLED = _os.environ.get("SGLANG_Q4_BATCHED_DECODE", "0") == "1"
 
+# Static Q4_0 decode path for CUDA graph compatibility.
+# When enabled, the decode path is branchless (no Python `if`s on tensor shapes
+# or pool state), so the forward pass can be captured by CUDA graph.
+# Assumes bs=1 (matches --cuda-graph-max-bs 1) and standard decode invariants
+# (cache_loc set, save_kv_cache=True, k/v provided, Q4_0 pool active).
+_Q40_STATIC_FOR_GRAPH = _os.environ.get("SGLANG_Q40_STATIC", "0") == "1"
+
 
 def _next_pow2(n):
     p = 1
@@ -253,7 +287,7 @@ def _next_pow2(n):
     return p
 
 
-def q40_attention_decode(q, k_q4, k_scale, v_q4, v_scale, h_kv=None, chunk=512):
+def q40_attention_decode(q, k_q4, k_scale, v_q4, v_scale, h_kv=None, chunk=512, window_size=0):
     """bs=1 decode attention reading Q4_0 packed buffers directly.
 
     Args:
@@ -261,6 +295,8 @@ def q40_attention_decode(q, k_q4, k_scale, v_q4, v_scale, h_kv=None, chunk=512):
         k_q4, v_q4: (S, H_KV, D//2) uint8 packed — H_KV = kv heads (GQA)
         k_scale, v_scale: (S, H_KV*D//32) fp16
         h_kv: number of KV heads (defaults to H i.e. MHA)
+        chunk: CHUNK size for kernel grid
+        window_size: sliding-window size (0 = full attention, >0 = SWA)
     Returns:
         (H, D) bf16 attention output
     """
@@ -269,13 +305,22 @@ def q40_attention_decode(q, k_q4, k_scale, v_q4, v_scale, h_kv=None, chunk=512):
     H, D = q.shape
     H_KV = h_kv if h_kv is not None else H
     S = k_q4.shape[0]
+    if _HADAMARD_IMPORT_OK and _hadamard_enabled() and D in (32, 64, 128, 256) and (D & (D - 1)) == 0:
+        H_rot = _q40_get_hadamard(D, str(q.device), q.dtype)
+        q = torch.matmul(q, H_rot)
     out = torch.zeros(H, D, dtype=torch.bfloat16, device=q.device)
     D_PAD = _next_pow2(D)
     scale = D ** -0.5
-    grid = (H * ((S + chunk - 1) // chunk),)
+    if window_size and window_size > 0 and window_size < S:
+        swa_start = S - int(window_size)
+    else:
+        swa_start = 0
+    eff_len = S - swa_start
+    chunks = (eff_len + chunk - 1) // chunk
+    grid = (H * chunks,)
     _q40_decode_attn_kernel[grid](
         q, k_q4, k_scale, v_q4, v_scale, out,
-        S, H, D=D, D_PAD=D_PAD, BLOCK=32, CHUNK=chunk, SCALE=scale, H_KV=H_KV,
+        S, swa_start, H, D=D, D_PAD=D_PAD, BLOCK=32, CHUNK=chunk, SCALE=scale, H_KV=H_KV,
         num_warps=1,
     )
     return out
@@ -284,7 +329,7 @@ def q40_attention_decode(q, k_q4, k_scale, v_q4, v_scale, h_kv=None, chunk=512):
 def q40_attention_decode_batched(
     q, k_q4, k_scale, v_q4, v_scale,
     token_indices, cu_seqlens, B,
-    h_kv=None, chunk=512,
+    h_kv=None, chunk=512, window_size=0,
 ):
     """Multi-batch paged decode attention reading Q4_0 packed buffers.
 
@@ -296,6 +341,8 @@ def q40_attention_decode_batched(
         cu_seqlens: (B+1,) int32 — cumulative sequence lengths
         B: batch size
         h_kv: number of KV heads (defaults to H i.e. MHA)
+        chunk: CHUNK size for kernel grid
+        window_size: sliding-window size (0 = full attention, >0 = SWA per batch)
     Returns:
         (B, H, D) bf16 attention output
     """
@@ -303,13 +350,16 @@ def q40_attention_decode_batched(
         raise RuntimeError("Triton Q4_0 batched attention kernel not available")
     H, D = q.shape[1], q.shape[2]
     H_KV = h_kv if h_kv is not None else H
+    if _HADAMARD_IMPORT_OK and _hadamard_enabled() and D in (32, 64, 128, 256) and (D & (D - 1)) == 0:
+        H_rot = _q40_get_hadamard(D, str(q.device), q.dtype)
+        q = torch.matmul(q, H_rot)
     out = torch.zeros(B, H, D, dtype=torch.bfloat16, device=q.device)
     D_PAD = _next_pow2(D)
     scale = D ** -0.5
     grid = (B, H)
     _q40_decode_attn_kernel_batched[grid](
         q, k_q4, k_scale, v_q4, v_scale, out,
-        token_indices, cu_seqlens,
+        token_indices, cu_seqlens, int(window_size),
         H=H, D=D, D_PAD=D_PAD, BLOCK=32, CHUNK=chunk, SCALE=scale, H_KV=H_KV,
         num_warps=1,
     )
@@ -341,6 +391,7 @@ if _BACKEND_AVAILABLE:
             self._req_to_token_pool = None
             self._fallback_warned = False
             self._shape_warned = False
+            self._q4_0_static = _Q40_STATIC_FOR_GRAPH and self.q40_available
 
         @property
         def token_to_kv_pool(self):
@@ -414,6 +465,7 @@ if _BACKEND_AVAILABLE:
                 return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
             h_kv = layer.tp_k_head_num
+            window_size = max(0, int(getattr(layer, "sliding_window_size", -1) or 0))
             pool = self.runner.token_to_kv_pool
             try:
                 if save_kv_cache:
@@ -445,7 +497,7 @@ if _BACKEND_AVAILABLE:
                     v_scale_s = v_scale[tok_slots]
                     out_hd = q40_attention_decode(
                         q_t, k_q4_s, k_scale_s, v_q4_s, v_scale_s,
-                        h_kv=h_kv, chunk=self.decode_chunk,
+                        h_kv=h_kv, chunk=self.decode_chunk, window_size=window_size,
                     )
                     return out_hd.view(1, H * D).to(torch.float16)
 
@@ -460,7 +512,7 @@ if _BACKEND_AVAILABLE:
                 out = q40_attention_decode_batched(
                     q_reshaped, k_q4, k_scale, v_q4, v_scale,
                     token_indices, cu_seqlens, B,
-                    h_kv=h_kv, chunk=self.decode_chunk,
+                    h_kv=h_kv, chunk=self.decode_chunk, window_size=window_size,
                 )
                 return out.view(B, H * D).to(torch.float16)
             except Exception as e:
@@ -515,6 +567,8 @@ if _BACKEND_AVAILABLE:
                 )
 
         def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
+            if self._q4_0_static:
+                return self._q4_0_decode_static(q, k, v, layer, forward_batch)
             out = self._try_q40_decode(
                 q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
             )
@@ -523,6 +577,42 @@ if _BACKEND_AVAILABLE:
             return self.full_attn_backend.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
+
+        def _q4_0_decode_static(self, q, k, v, layer, forward_batch):
+            """Branchless Q4_0 decode for CUDA graph capture (bs=1).
+
+            Assumes standard decode invariants (validated at init via _q4_0_static):
+              - bs == 1 (matches --cuda-graph-max-bs 1)
+              - pool has Q4_0 buffers
+              - k, v are provided
+              - forward_batch has out_cache_loc
+            """
+            h_kv = layer.tp_k_head_num
+            window_size = max(0, int(getattr(layer, "sliding_window_size", -1) or 0))
+            pool = self.runner.token_to_kv_pool
+
+            cache_loc = forward_batch.out_cache_loc
+            pool.set_kv_buffer(layer, cache_loc, k, v)
+
+            k_q4, k_scale, v_q4, v_scale = pool.get_q4_kv_buffers(layer.layer_id)
+
+            req_pool = self.runner.req_to_token_pool
+            req_to_token = req_pool.req_to_token
+            rp_idx = forward_batch.req_pool_indices[0]
+            seq_len = forward_batch.seq_lens[0]
+            tok_slots = req_to_token[rp_idx, :seq_len]
+            H = layer.tp_q_head_num
+            D = layer.head_dim
+            q_t = q[0].view(H, D).contiguous()
+            k_q4_s = k_q4[tok_slots]
+            k_scale_s = k_scale[tok_slots]
+            v_q4_s = v_q4[tok_slots]
+            v_scale_s = v_scale[tok_slots]
+            out_hd = q40_attention_decode(
+                q_t, k_q4_s, k_scale_s, v_q4_s, v_scale_s,
+                h_kv=h_kv, chunk=self.decode_chunk, window_size=window_size,
+            )
+            return out_hd.view(1, H * D).to(torch.float16)
 
         def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
             return self.full_attn_backend.forward_extend(
